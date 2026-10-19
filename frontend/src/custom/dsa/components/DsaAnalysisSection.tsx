@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { FlaskConical, ListChecks, Play, RefreshCw, Trash2 } from 'lucide-react'
+import { ArrowDown, FlaskConical, ListChecks, Play, RefreshCw, Trash2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { storage } from '@/lib/storage'
 import { EmptyState } from '@/components/EmptyState'
@@ -17,6 +17,13 @@ const primaryBtnCls =
 function fmtTime(iso: string) {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+// 本地日期键 (YYYY-MM-DD), 与表格展示的本地时间一致; 无效日期返回空串以排到末尾
+function dayKey(iso: string) {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
 function PointsCell({ points }: { points?: ReportSummary['points'] | null }) {
@@ -207,13 +214,26 @@ function ReportsTable({
   onOpen: (id: string) => void
   onDelete?: (id: string) => void
 }) {
+  // 排序: 日期倒序 → 同一天评分降序 → 同分时间倒序 (缺评分视为最低, 无效日期排末尾)
+  const sortedRows = [...rows].sort((a, b) => {
+    const aDay = dayKey(a.created_at)
+    const bDay = dayKey(b.created_at)
+    if (aDay !== bDay) return bDay.localeCompare(aDay)
+    const aScore = a.sentiment_score ?? -Infinity
+    const bScore = b.sentiment_score ?? -Infinity
+    if (aScore !== bScore) return bScore - aScore
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  })
+
   return (
     <table className="w-full text-xs">
       <thead>
         <tr className="text-left text-muted border-b border-border">
           <th className="py-2 pr-2 font-medium whitespace-nowrap">时间</th>
           <th className="px-2 py-2 font-medium whitespace-nowrap">代码</th>
-          <th className="px-2 py-2 font-medium whitespace-nowrap">评分</th>
+          <th aria-sort="descending" title="按日期倒序，同一天评分从高到低，同分按时间倒序" className="px-2 py-2 font-medium whitespace-nowrap">
+            <span className="inline-flex items-center gap-1">评分<ArrowDown aria-hidden="true" className="h-3 w-3" /></span>
+          </th>
           <th className="px-2 py-2 font-medium whitespace-nowrap">建议</th>
           <th className="px-2 py-2 font-medium whitespace-nowrap">点位</th>
           <th className="px-2 py-2 font-medium">摘要</th>
@@ -221,7 +241,7 @@ function ReportsTable({
         </tr>
       </thead>
       <tbody>
-        {rows.map((r) => (
+        {sortedRows.map((r) => (
           <tr
             key={r.id}
             className="border-b border-border/50 hover:bg-elevated/40 cursor-pointer transition-colors"

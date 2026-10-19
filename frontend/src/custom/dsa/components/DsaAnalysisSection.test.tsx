@@ -6,7 +6,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { storage } from '@/lib/storage'
-import { dsaApi, type AnalysisTask } from '../api'
+import { dsaApi, type AnalysisTask, type ReportSummary } from '../api'
 import { DsaAnalysisSection } from './DsaAnalysisSection'
 
 vi.mock('@/components/Toast', () => ({ toast: vi.fn() }))
@@ -124,4 +124,56 @@ it('轮询返回 404 (任务已丢失) → 卡片移除并清理 localStorage', 
 
   expect(host.textContent).not.toContain('分析任务 task-gone')
   expect(storage.dsaAnalysisTasks.get([])).toEqual([])
+})
+
+it.each(['今日', '往期', 'DSA 历史（只读）'])('%s 报告按评分降序，同分按时间倒序，缺评分排末尾', async (view) => {
+  const items: ReportSummary[] = [
+    { id: 'missing', symbol: '000001.SZ', created_at: '2026-10-15T20:00:00' },
+    { id: 'low', symbol: '000002.SZ', created_at: '2026-10-15T19:00:00', sentiment_score: 15 },
+    { id: 'tie-old', symbol: '000003.SZ', created_at: '2026-10-15T17:00:00', sentiment_score: 60 },
+    { id: 'high', symbol: '000004.SZ', created_at: '2026-10-15T16:00:00', sentiment_score: 90 },
+    { id: 'tie-new', symbol: '000005.SZ', created_at: '2026-10-15T18:00:00', sentiment_score: 60 },
+    { id: 'null', symbol: '000006.SZ', created_at: '2026-10-15T21:00:00', sentiment_score: null },
+    { id: 'zero', symbol: '000007.SZ', created_at: '2026-10-15T15:00:00', sentiment_score: 0 },
+  ]
+  vi.mocked(dsaApi.reports).mockResolvedValue({ total: items.length, items })
+  vi.mocked(dsaApi.legacyReports).mockResolvedValue({ total: items.length, items })
+  try {
+    await renderSection()
+    if (view !== '今日') {
+      await act(async () => {
+        Array.from(host.querySelectorAll('button')).find((b) => b.textContent === view)!.click()
+      })
+      await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    }
+
+    expect(Array.from(host.querySelectorAll('tbody tr')).map((row) => row.children[1].textContent?.trim()))
+      .toEqual(['000004.SZ', '000005.SZ', '000003.SZ', '000002.SZ', '000007.SZ', '000006.SZ', '000001.SZ'])
+    expect(items.map((item) => item.id)).toEqual(['missing', 'low', 'tie-old', 'high', 'tie-new', 'null', 'zero'])
+  } finally {
+    vi.mocked(dsaApi.reports).mockResolvedValue({ total: 0, items: [] })
+    vi.mocked(dsaApi.legacyReports).mockResolvedValue({ total: 0, items: [] })
+  }
+})
+
+it('跨日期时先按日期倒序，再按同一天评分降序、同分时间倒序', async () => {
+  // 高分的旧报告不能压过今天的新报告
+  const items: ReportSummary[] = [
+    { id: 'd14-high', symbol: '000001.SZ', created_at: '2026-10-14T09:00:00', sentiment_score: 95 },
+    { id: 'd15-low', symbol: '000002.SZ', created_at: '2026-10-15T09:00:00', sentiment_score: 10 },
+    { id: 'd15-tie-old', symbol: '000003.SZ', created_at: '2026-10-15T08:00:00', sentiment_score: 70 },
+    { id: 'd13-missing', symbol: '000004.SZ', created_at: '2026-10-13T10:00:00' },
+    { id: 'd15-tie-new', symbol: '000005.SZ', created_at: '2026-10-15T11:00:00', sentiment_score: 70 },
+    { id: 'd14-low', symbol: '000006.SZ', created_at: '2026-10-14T23:00:00', sentiment_score: 20 },
+  ]
+  vi.mocked(dsaApi.reports).mockResolvedValue({ total: items.length, items })
+  try {
+    await renderSection()
+
+    expect(Array.from(host.querySelectorAll('tbody tr')).map((row) => row.children[1].textContent?.trim()))
+      .toEqual(['000005.SZ', '000003.SZ', '000002.SZ', '000001.SZ', '000006.SZ', '000004.SZ'])
+    expect(items.map((item) => item.id)).toEqual(['d14-high', 'd15-low', 'd15-tie-old', 'd13-missing', 'd15-tie-new', 'd14-low'])
+  } finally {
+    vi.mocked(dsaApi.reports).mockResolvedValue({ total: 0, items: [] })
+  }
 })
