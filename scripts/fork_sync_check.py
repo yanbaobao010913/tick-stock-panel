@@ -66,6 +66,8 @@ class Marker:
     path: str
     pattern: str
     label: str
+    # True 表示该模式必须"不存在" (如被故意隐藏的导航项)
+    absent: bool = False
 
 
 # 关键实现标记: 符号还在但调用链被绕开时, 行为测试才是主防线;
@@ -78,6 +80,16 @@ REQUIRED_MARKERS = (
     Marker("backend/app/services/instrument_sync.py", r"_EXCHANGE_RETRIES", "标的维表分交易所重试"),
     Marker("backend/app/jobs/daily_pipeline.py", r"minute_allowed", "分钟同步能力门控"),
     Marker("backend/app/backtest/matrix.py", r'timing_ms\["axes"\]', "矩阵分段计时"),
+    # v0.3.9 同步中曾被整文件取上游吞掉, 补标记防止再次静默丢失
+    Marker("frontend/index.html", r"tf-page-zoom", "页面缩放预渲染脚本"),
+    Marker("frontend/src/main.tsx", r"installTspExtBridge", "运行时扩展桥"),
+    Marker("frontend/src/components/Layout.tsx", r"layout\.header\.quick", "侧栏快捷入口插槽"),
+    Marker("frontend/src/components/Layout.tsx", r"defaultNavIndex", "默认导航排序"),
+    Marker("frontend/src/pages/settings/System.tsx", r"UpgradeGuardCard", "升级保护设置卡"),
+    # fork 在上游扩展上的定制
+    Marker("frontend/src/custom/paper/extension.tsx", r"100000", "模拟盘默认资金 10 万"),
+    Marker("frontend/src/custom/stock-analysis/extension.tsx", r"DsaAnalysisSection", "个股分析 DSA 区块"),
+    Marker("frontend/src/custom/lots/extension.tsx", r"navigation\s*:", "持仓提醒导航项(已按拍板隐藏)", absent=True),
 )
 
 
@@ -101,7 +113,12 @@ def run_checks(root: Path) -> list[str]:
         if not path.is_file():
             failures.append(f"缺少实现文件 ({marker.label}): {marker.path}")
             continue
-        if not re.search(marker.pattern, path.read_text(encoding="utf-8")):
+        found = re.search(marker.pattern, path.read_text(encoding="utf-8")) is not None
+        if marker.absent and found:
+            failures.append(
+                f"不应出现的实现 ({marker.label}): {marker.path} 中匹配到 /{marker.pattern}/"
+            )
+        elif not marker.absent and not found:
             failures.append(
                 f"实现标记丢失 ({marker.label}): {marker.path} 中找不到 /{marker.pattern}/"
             )
