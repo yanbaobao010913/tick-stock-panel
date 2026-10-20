@@ -104,4 +104,4 @@ git diff --numstat origin/main...HEAD | sort -k1,1nr   # 按改动量排序
 
 - 上游基线记 Git tag(`v0.3.9`),不等于发行版本。
 - Docker 走 `fork/main` push 自动构建;桌面安装包走 `release.yml`(`workflow_dispatch`),要求传入版本等于 `frontend/package.json`。
-- 当前 `frontend/package.json` 0.3.5、`backend/pyproject.toml` 0.3.3、上游 0.3.9,发桌面包前先对齐。
+- 版本已对齐上游基线 0.3.9:`frontend/package.json`、`backend/pyproject.toml`、`VERSION`、`release.yml` 默认值同源,发版前只需改这一处基线。

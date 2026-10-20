@@ -44,6 +44,17 @@ REQUIRED_TESTS = (
     "backend/tests/test_stocksdk_provider.py",
 )
 
+# 上游回归测试: 曾在同步回补时被静默删除 (2026-10-20), 保留它们守住
+# 上游行为不被 fork 改动带偏。文件随上游演进可替换, 但不得无声消失。
+REQUIRED_UPSTREAM_TESTS = (
+    "backend/tests/backtest/test_dependencies.py",
+    "backend/tests/test_openapi_contract.py",
+    "backend/tests/test_shared_matrix_cache.py",
+    "backend/tests/test_strategy_required_history.py",
+    "backend/tests/test_strategy_safety_validation.py",
+    "backend/tests/test_tdxquant_probe.py",
+)
+
 # fork 独有的模块与扩展注册目录: 路径消失即功能消失。
 REQUIRED_PATHS = (
     "backend/app/strategy/price_path.py",
@@ -104,6 +115,10 @@ def run_checks(root: Path) -> list[str]:
         elif path.stat().st_size == 0:
             failures.append(f"fork 回归测试为空文件: {rel}")
 
+    for rel in REQUIRED_UPSTREAM_TESTS:
+        if not (root / rel).is_file():
+            failures.append(f"缺少上游回归测试: {rel}")
+
     for rel in REQUIRED_PATHS:
         if not (root / rel).is_file():
             failures.append(f"缺少 fork 模块/扩展注册: {rel}")
@@ -149,7 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(
-        f"fork 契约自检通过: {len(REQUIRED_TESTS)} 个回归测试, "
+        f"fork 契约自检通过: {len(REQUIRED_TESTS)} 个 fork 回归测试, "
+        f"{len(REQUIRED_UPSTREAM_TESTS)} 个上游回归测试, "
         f"{len(REQUIRED_PATHS)} 个模块/注册, {len(REQUIRED_MARKERS)} 个实现标记。"
     )
     return 0

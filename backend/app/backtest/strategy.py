@@ -196,7 +196,13 @@ class StrategyDependencyResolver:
 
         indicator_columns = frozenset(required_features & set(INDICATOR_COLUMNS))
         base_columns = _resolve_base_columns(required_features | set(_EXECUTION_COLUMNS))
-        if required_signals & set(LIMIT_SIGNAL_OUTPUTS):
+        # 涨跌停族: 显式请求连板/判定价列, 或引用了判定价的自定义信号
+        # (signal_limit_* 等迁移定义) → 统一加载不复权三价。
+        if (required_signals & set(LIMIT_SIGNAL_OUTPUTS)) or any(
+            signal_dependencies.get(sig, frozenset())
+            & {"limit_up_price", "limit_down_price"}
+            for sig in required_signals
+        ):
             base_columns = frozenset(set(base_columns) | set(_LIMIT_BASE_COLUMNS))
 
         instrument_columns = frozenset(required_features & set(_INSTRUMENT_COLUMNS))
