@@ -8,6 +8,7 @@ import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import { LastStockChip } from '@/components/LastStockChip'
 import { AnalysisKChart, type PriceLevel, type LevelType } from '@/components/stock-analysis/AnalysisKChart'
 import { PriceAlertDialog } from '@/components/stock-analysis/PriceAlertDialog'
+import { DsaAnalysisSection } from '@/custom/dsa/components/DsaAnalysisSection'
 import { api } from '@/lib/api'
 import { useLastStock } from '@/lib/useLastStock'
 import { QK } from '@/lib/queryKeys'
@@ -143,6 +144,9 @@ export function StockAnalysis() {
           </div>
           <HistorySidebar />
         </div>
+
+        {/* DSA 决策报告区 (扩展注入, 见 frontend/src/custom/dsa/) */}
+        <DsaAnalysisSection symbol={symbol || undefined} />
       </div>
 
       {/* 二次确认:已有历史报告 */}

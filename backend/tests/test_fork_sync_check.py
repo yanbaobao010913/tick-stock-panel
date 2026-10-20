@@ -44,6 +44,22 @@ def test_missing_marker_is_reported(tmp_path: Path):
     assert any("实现标记丢失 (桌面启动失败页)" in f for f in failures)
 
 
+def test_forbidden_marker_is_reported(tmp_path: Path):
+    module = _load_module()
+    lots = tmp_path / "frontend" / "src" / "custom" / "lots" / "extension.tsx"
+    lots.parent.mkdir(parents=True)
+    lots.write_text("export default { navigation: [] }\n", encoding="utf-8")
+
+    failures = module.run_checks(tmp_path)
+    assert any("不应出现的实现 (持仓提醒导航项" in f for f in failures)
+
+
+def test_missing_upstream_test_is_reported(tmp_path: Path):
+    module = _load_module()
+    failures = module.run_checks(tmp_path)
+    assert any("缺少上游回归测试: backend/tests/test_openapi_contract.py" in f for f in failures)
+
+
 def test_missing_path_is_reported(tmp_path: Path):
     module = _load_module()
     failures = module.run_checks(tmp_path)

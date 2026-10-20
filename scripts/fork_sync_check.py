@@ -44,6 +44,17 @@ REQUIRED_TESTS = (
     "backend/tests/test_stocksdk_provider.py",
 )
 
+# 上游回归测试: 曾在同步回补时被静默删除 (2026-10-20), 保留它们守住
+# 上游行为不被 fork 改动带偏。文件随上游演进可替换, 但不得无声消失。
+REQUIRED_UPSTREAM_TESTS = (
+    "backend/tests/backtest/test_dependencies.py",
+    "backend/tests/test_openapi_contract.py",
+    "backend/tests/test_shared_matrix_cache.py",
+    "backend/tests/test_strategy_required_history.py",
+    "backend/tests/test_strategy_safety_validation.py",
+    "backend/tests/test_tdxquant_probe.py",
+)
+
 # fork 独有的模块与扩展注册目录: 路径消失即功能消失。
 REQUIRED_PATHS = (
     "backend/app/strategy/price_path.py",
@@ -66,6 +77,8 @@ class Marker:
     path: str
     pattern: str
     label: str
+    # True 表示该模式必须"不存在" (如被故意隐藏的导航项)
+    absent: bool = False
 
 
 # 关键实现标记: 符号还在但调用链被绕开时, 行为测试才是主防线;
@@ -78,6 +91,18 @@ REQUIRED_MARKERS = (
     Marker("backend/app/services/instrument_sync.py", r"_EXCHANGE_RETRIES", "标的维表分交易所重试"),
     Marker("backend/app/jobs/daily_pipeline.py", r"minute_allowed", "分钟同步能力门控"),
     Marker("backend/app/backtest/matrix.py", r'timing_ms\["axes"\]', "矩阵分段计时"),
+    # v0.3.9 同步中曾被整文件取上游吞掉, 补标记防止再次静默丢失
+    Marker("frontend/index.html", r"tf-page-zoom", "页面缩放预渲染脚本"),
+    Marker("frontend/src/main.tsx", r"installTspExtBridge", "运行时扩展桥"),
+    Marker("frontend/src/components/Layout.tsx", r"layout\.header\.quick", "侧栏快捷入口插槽"),
+    Marker("frontend/src/components/Layout.tsx", r"defaultNavIndex", "默认导航排序"),
+    Marker("frontend/src/pages/settings/System.tsx", r"UpgradeGuardCard", "升级保护设置卡"),
+    Marker("frontend/src/components/dashboard/registry.tsx", r"EmotionScoreConfigDialog", "情绪雷达评分配置入口"),
+    Marker("frontend/src/components/stock-table/MiniIntraday.tsx", r"lastClose > baseline", "分时小图按基准线压线着色"),
+    # fork 在上游扩展上的定制
+    Marker("frontend/src/custom/paper/extension.tsx", r"100000", "模拟盘默认资金 10 万"),
+    Marker("frontend/src/custom/stock-analysis/extension.tsx", r"DsaAnalysisSection", "个股分析 DSA 区块"),
+    Marker("frontend/src/custom/lots/extension.tsx", r"navigation\s*:", "持仓提醒导航项(已按拍板隐藏)", absent=True),
 )
 
 
@@ -92,6 +117,10 @@ def run_checks(root: Path) -> list[str]:
         elif path.stat().st_size == 0:
             failures.append(f"fork 回归测试为空文件: {rel}")
 
+    for rel in REQUIRED_UPSTREAM_TESTS:
+        if not (root / rel).is_file():
+            failures.append(f"缺少上游回归测试: {rel}")
+
     for rel in REQUIRED_PATHS:
         if not (root / rel).is_file():
             failures.append(f"缺少 fork 模块/扩展注册: {rel}")
@@ -101,7 +130,12 @@ def run_checks(root: Path) -> list[str]:
         if not path.is_file():
             failures.append(f"缺少实现文件 ({marker.label}): {marker.path}")
             continue
-        if not re.search(marker.pattern, path.read_text(encoding="utf-8")):
+        found = re.search(marker.pattern, path.read_text(encoding="utf-8")) is not None
+        if marker.absent and found:
+            failures.append(
+                f"不应出现的实现 ({marker.label}): {marker.path} 中匹配到 /{marker.pattern}/"
+            )
+        elif not marker.absent and not found:
             failures.append(
                 f"实现标记丢失 ({marker.label}): {marker.path} 中找不到 /{marker.pattern}/"
             )
@@ -132,7 +166,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(
-        f"fork 契约自检通过: {len(REQUIRED_TESTS)} 个回归测试, "
+        f"fork 契约自检通过: {len(REQUIRED_TESTS)} 个 fork 回归测试, "
+        f"{len(REQUIRED_UPSTREAM_TESTS)} 个上游回归测试, "
         f"{len(REQUIRED_PATHS)} 个模块/注册, {len(REQUIRED_MARKERS)} 个实现标记。"
     )
     return 0

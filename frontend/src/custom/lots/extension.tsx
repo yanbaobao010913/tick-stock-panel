@@ -14,7 +14,6 @@ import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import { toNavItems } from '@/lib/listNav'
 import { boardTag } from '@/components/stock-table/primitives'
 import type { FrontendExtension } from '@/extensions/types'
-import { IconLots } from '@/components/BrandIcons'
 
 const emptyDraft = (): Lot => ({
   id: '',
@@ -424,9 +423,8 @@ const extension: FrontendExtension = {
   routes: [
     { id: 'lots', path: '/lots', component: Lots },
   ],
-  navigation: [
-    { id: 'lots', routeId: 'lots', label: '持仓提醒', icon: IconLots },
-  ],
+  // dsa-migration: 持仓提醒菜单按用户拍板隐藏 (2026-09-29) — 其手动批次提醒与
+  // DSA 报告点位自动挂线体系重复; 仅保留路由可直达, 上游冲突时重贴本注释。
 }
 
 export default extension

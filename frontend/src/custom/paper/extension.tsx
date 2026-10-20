@@ -171,7 +171,7 @@ function loadNewAccountDefaults(): Required<NewAccountDefaults> {
   try { last = JSON.parse(localStorage.getItem(NEW_ACCOUNT_DEFAULTS_KEY) || '{}') } catch { /* 忽略坏数据 */ }
   const src = { ...last, ...base }
   return {
-    cash: src.cash ?? '1000000',
+    cash: src.cash ?? '100000',
     commissionWan: src.commissionWan ?? '2.5',   // 万2.5
     stampQian: src.stampQian ?? '1',             // 千1 (仅卖出)
     slippageBps: src.slippageBps ?? '5',         // 5bps
@@ -300,7 +300,7 @@ function SetupCard({ accId, onDone, onCancel }: { accId: string; onDone: (create
         value={cash}
         onChange={e => setCash(e.target.value)}
         className="mt-1 w-full rounded-btn border border-border bg-base px-3 py-2 font-mono text-sm outline-none focus:border-accent/50"
-        placeholder="1000000"
+        placeholder="100000"
       />
       <div className="mt-3 grid grid-cols-3 gap-2">
         <div>
@@ -955,7 +955,7 @@ function BaseDefaultsModal({ onClose }: { onClose: () => void }) {
   }
   const reset = () => {
     try { localStorage.removeItem(PAPER_BASE_DEFAULTS_KEY) } catch { /* 静默 */ }
-    setCash('1000000'); setCommissionWan('2.5'); setStampQian('1'); setSlippageBps('5')
+    setCash('100000'); setCommissionWan('2.5'); setStampQian('1'); setSlippageBps('5')
   }
   const inputCls = 'mt-1 w-full rounded-btn border border-border bg-base px-2 py-1.5 font-mono text-sm outline-none focus:border-accent/50'
   return (
@@ -997,7 +997,7 @@ function BaseDefaultsModal({ onClose }: { onClose: () => void }) {
             <button
               onClick={reset}
               className="rounded-btn border border-border px-3 text-xs text-muted transition-colors hover:border-warning/40 hover:text-warning"
-              title="清除自定义基础配置, 回落内置默认 (100万 / 万2.5 / 千1 / 5bps)"
+              title="清除自定义基础配置, 回落内置默认 (10万 / 万2.5 / 千1 / 5bps)"
             >
               恢复内置默认
             </button>
