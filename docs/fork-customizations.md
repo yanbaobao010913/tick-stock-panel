@@ -40,31 +40,18 @@ cd ../frontend && pnpm build
 | 纸质交易条件单(依赖日线 high/low) | `backend/app/strategy/paper.py` `read_daily_bar` 返回完整 OHLC | `test_paper_conditional.py` `test_paper_bar_read_schema.py` |
 | DSA 桥接(分析/回测/组合/自选/提醒) | `backend/app/custom/dsa_bridge.py` 等 | `test_dsa_*.py` |
 
-## 3. 前端页面的双重注册(待迁移, 优先处理)
+## 3. 前端页面注册(v0.3.9 起已迁移到扩展)
 
-11 个 fork 页面目前每页有**两份实现**:
+v0.3.6 起上游采用「核心 + 扩展」架构:页面、路由、侧栏导航统一由 `frontend/src/custom/<ns>/extension.tsx` 单文件声明,构建时自动发现。fork 曾另有 11 份 `frontend/src/pages/<X>.tsx` 副本并手工注册进 `router.tsx`,导致双重注册、重复导航和扩展被 `CORE_ROUTE_PATHS` 拒绝;这些副本已在 v0.3.9 同步中删除。
 
-- `frontend/src/pages/<X>.tsx` —— fork 新增,由 `router.tsx` 手工注册;
-- `frontend/src/custom/<ns>/extension.tsx` —— 与上游共享,声明 `routes` + `navigation`。
+迁移后:
 
-`router.tsx` 的 `CORE_ROUTE_PATHS` 包含这些路径,`finalizeFrontendExtensions()` 会以「试图覆盖核心路由」把整个扩展移除。因此线上生效的是 `pages/<X>.tsx`,扩展声明是死代码,且每次同步都要改上游的 `router.tsx`。
-
-待迁移页面(路径):
-
-```text
-/concept-analysis /industry-analysis /stock-analysis /review
-/financials /monitor /lots /paper /signals /limit-ladder /abnormal
-```
-
-迁移步骤(一个页面一个提交):
-
-1. 确认 `custom/<ns>/extension.tsx` 内的页面实现与 `pages/<X>.tsx` 等价(当前两份是复制的, 不是同一模块);
-2. 从 `router.tsx` 删除该页的 lazy import、`CORE_ROUTE_PATHS` 条目和路由项;
-3. 删除 `pages/<X>.tsx` 副本;
-4. 验证导航、直接刷新、桌面构建;
-5. 更新本文件。
-
-全部迁移完成后,`router.tsx` 应只剩上游内容。
+- `router.tsx`、`Layout.tsx` 的 `nav` 与上游一致(核心 8 项 + 扩展自动追加),同步时不再需要手工改这两个文件;
+- 扩展页面的路径与导航改动一律进 `custom/<ns>/extension.tsx`;
+- fork 在扩展上的三处定制必须保留(契约自检已覆盖):
+  - `custom/paper/extension.tsx`:新账户默认资金 10 万;
+  - `custom/stock-analysis/extension.tsx`:页面底部注入 `DsaAnalysisSection`;
+  - `custom/lots/extension.tsx`:仅保留路由,不注册「持仓提醒」导航项(DSA 报告点位已覆盖手动批次提醒)。
 
 ## 4. 已知 L3 改动区(每次同步必须人工复核)
 
