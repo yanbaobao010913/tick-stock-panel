@@ -97,6 +97,8 @@ REQUIRED_MARKERS = (
     Marker("frontend/src/components/Layout.tsx", r"layout\.header\.quick", "侧栏快捷入口插槽"),
     Marker("frontend/src/components/Layout.tsx", r"defaultNavIndex", "默认导航排序"),
     Marker("frontend/src/pages/settings/System.tsx", r"UpgradeGuardCard", "升级保护设置卡"),
+    Marker("frontend/src/components/dashboard/registry.tsx", r"EmotionScoreConfigDialog", "情绪雷达评分配置入口"),
+    Marker("frontend/src/components/stock-table/MiniIntraday.tsx", r"lastClose > baseline", "分时小图按基准线压线着色"),
     # fork 在上游扩展上的定制
     Marker("frontend/src/custom/paper/extension.tsx", r"100000", "模拟盘默认资金 10 万"),
     Marker("frontend/src/custom/stock-analysis/extension.tsx", r"DsaAnalysisSection", "个股分析 DSA 区块"),
