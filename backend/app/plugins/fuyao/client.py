@@ -27,15 +27,7 @@ _PAGE_INTERVAL_S = 0.15  # 页间隔, 降低触发限频 (code=4001) 的概率
 
 
 class FuyaoError(Exception):
-    """扶摇接口错误(配置缺失 / 网络失败 / 信封 code != 0)。
-
-    code = 信封错误码(如 4001 限频 / 1002 未知代码 / 5003 无数据), 供上层
-    区分处理; 网络/HTTP 层错误为 None。
-    """
-
-    def __init__(self, msg: str = "", code: int | str | None = None):
-        super().__init__(msg)
-        self.code = code
+    """扶摇接口错误(配置缺失 / 网络失败 / 信封 code != 0)。"""
 
 
 class FuyaoClient:
@@ -69,7 +61,7 @@ class FuyaoClient:
             raise FuyaoError(f"响应不是 JSON: {path}") from e
         code = payload.get("code")
         if code not in (0, "0", None):
-            raise FuyaoError(f"扶摇接口错误 code={code}: {payload.get('message', '')} ({path})", code=code)
+            raise FuyaoError(f"扶摇接口错误 code={code}: {payload.get('message', '')} ({path})")
         return payload.get("data") or {}
 
     # ---- 快照 ----

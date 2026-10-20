@@ -47,11 +47,8 @@ class OrderModel(BaseModel):
     side: str                       # buy / sell
     qty: int | None = None
     amount: float | None = None
-    order_type: str = "market"      # market / next_open / close / conditional
+    order_type: str = "market"      # market / next_open / close
     ref_price: float | None = None  # amount 模式折算 & 买入资金预检
-    trigger_price: float | None = None  # conditional: 触发价 (>0)
-    trigger_op: str | None = None       # conditional: "<=" / ">="
-    expire: str = "day"                 # conditional: day / gtc
 
 
 class SettingsModel(BaseModel):
@@ -123,6 +120,15 @@ def create_account(request: Request, body: AccountModel):
     return {"account": acc}
 
 
+@router.delete("/account")
+def delete_account(request: Request, force: bool = False, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
+    """删除账户及其全部数据 (不可恢复)。仍有持仓或待成交订单时须 force=true。"""
+    result, err = paper.delete_account(_data_dir(request), _acc(request, account), force=force)
+    if err:
+        raise HTTPException(status_code=400 if "force" in (err or "") else 404, detail=err)
+    return {"ok": True, "deleted": _acc(request, account), **(result or {})}
+
+
 @router.get("/overview")
 def overview(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
     """总览: 现金 + 持仓估值 + 账户状态。
@@ -161,18 +167,12 @@ def create_order(request: Request, body: OrderModel, account: str = Query(paper.
     asset_type = _resolve_asset_type(request, body.symbol)
     ref_price = body.ref_price
     if ref_price is None:
-        # conditional 单金额折算/资金预检按触发价 (预期成交价上界); 其余按最近收盘
-        ref_price = (
-            body.trigger_price
-            if body.order_type == "conditional" and body.trigger_price is not None
-            else _last_close(data_dir, body.symbol, asset_type)
-        )
+        ref_price = _last_close(data_dir, body.symbol, asset_type)
     order, err = paper.create_order(
         data_dir, body.symbol, body.side,
         account_id=acc_id,
         qty=body.qty, amount=body.amount,
         order_type=body.order_type, asset_type=asset_type, ref_price=ref_price,
-        trigger_price=body.trigger_price, trigger_op=body.trigger_op, expire=body.expire,
     )
     if err:
         raise HTTPException(status_code=400, detail=err)
@@ -220,6 +220,12 @@ def get_stats(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
     return paper.stats(_data_dir(request), _acc(request, account))
 
 
+@router.get("/rounds")
+def list_rounds(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
+    """FIFO 配对回合明细 (开平日期/数量/盈亏/持有天数), 供账户面板流水展示。"""
+    return {"rounds": paper.round_trips(_data_dir(request), _acc(request, account))}
+
+
 @router.get("/compare")
 def compare_accounts(request: Request):
     """横向对比全部账户: 概览 + 回合统计 + 定版净值 (供对比表与净值叠加图)。
@@ -231,6 +237,22 @@ def compare_accounts(request: Request):
     from app.strategy import paper_auto
 
     data_dir = _data_dir(request)
+
+    # 盘中实时估算: 当日 enriched 快照就绪时取一次 raw_close 映射, 之后每账户
+    # 纯内存 overview (与 /overview 实时口径一致); 失败降级定版口径
+    live_snapshot: dict[str, float] | None = None
+    qs = getattr(request.app.state, "quote_service", None)
+    if qs is not None:
+        try:
+            enriched, enriched_date = qs.get_enriched_today()
+            from app.market_time import cn_today
+            if not enriched.is_empty() and enriched_date == cn_today():
+                live_snapshot = dict(
+                    zip(enriched["symbol"].to_list(), enriched["raw_close"].to_list(), strict=False)
+                )
+        except Exception as e:  # noqa: BLE001 — 快照来源不定 (行情服务/数据缺失), 软失败降级定版口径
+            logger.warning("paper compare 实时快照不可用, 用定版口径: %s", e)
+
     rows = []
     for acc_id in paper.list_account_ids(data_dir):
         acc = paper.get_account(data_dir, acc_id)
@@ -246,7 +268,18 @@ def compare_accounts(request: Request):
         if len(nav_rows) >= 2 and float(nav_rows[-2]["nav"] or 0) > 0:
             day_change_pct = round((float(nav_rows[-1]["nav"]) / float(nav_rows[-2]["nav"]) - 1) * 100, 2)
         rules = paper_auto.load_auto_rules(data_dir, acc_id)
+        # 盘中估算字段 (加法扩展): live_* 为快照价口径, 旧前端忽略不影响
+        live_total = live_pnl_pct = None
+        if live_snapshot is not None and acc.get("status") == "active":
+            live_ov = paper.overview(data_dir, live_snapshot, account_id=acc_id)
+            if live_ov.get("initialized"):
+                live_total = live_ov.get("total")
+                if initial > 0:
+                    live_pnl_pct = round((live_ov.get("total_pnl") or 0) / initial * 100, 2)
         rows.append({
+            "live_total": live_total,
+            "live_pnl_pct": live_pnl_pct,
+            "estimating": live_total is not None,
             "account": acc_id,
             "name": acc.get("name") or acc_id,
             "status": acc.get("status"),
@@ -324,6 +357,7 @@ class AutoRuleModel(BaseModel):
     size_value: float
     order_type: str = "next_open"
     cooldown_days: int = 5
+    max_positions: int = 0             # 最大同时持仓标的数, 0 不限 (对齐回测口径)
     enabled: bool = True
 
 
@@ -370,6 +404,7 @@ class ArenaSourceModel(BaseModel):
     size_value: float = 10.0
     order_type: str = "next_open"
     cooldown_days: int = 5
+    max_positions: int = 0             # 最大同时持仓标的数, 0 不限 (对齐回测口径)
 
 
 class ArenaBatchModel(BaseModel):
@@ -410,6 +445,7 @@ def arena_batch_create(request: Request, body: ArenaBatchModel):
                 "size_value": src.size_value,
                 "order_type": src.order_type,
                 "cooldown_days": src.cooldown_days,
+                "max_positions": src.max_positions,
                 "enabled": True,
             }
             paper_auto.validate_rule(rule)  # 全部通过前不落盘 (fail-closed)

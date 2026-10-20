@@ -508,12 +508,6 @@ class SignalMatrix:
     exit_signal_code: np.ndarray
     entry_signal_ids: tuple[str, ...] = ()
     exit_signal_ids: tuple[str, ...] = ()
-    # §4.7-2b DSA 点位: 逐格介入/止损/止盈价 (float32, NaN=该格无价位)。
-    # entry_price 为该格的介入价 (触及判定+min(open,价) 语义由 MatcherConfig.entry_touch
-    # 开启, 分钟策略的逐格精确成交价不开启); stop/take 跟随入场格, 撮合时注入逐仓位。
-    entry_price: np.ndarray | None = None
-    stop_price: np.ndarray | None = None
-    take_profit_price: np.ndarray | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -560,9 +554,6 @@ class MarketMatrix:
     # 逐格入场价覆盖 (time x asset, NaN=回退 open/close 惯例)。分钟策略回测用:
     # 信号在盘中第 m 根触发, 入场价 = 触发分钟收盘价, 而非当日开盘/收盘。
     entry_price: np.ndarray | None = None
-    # 逐仓位绝对风控线 (§4.7-2b DSA 点位): 跟随入场格, NaN=无 (回退 MatcherConfig 配置级)。
-    stop_price: np.ndarray | None = None
-    take_profit_price: np.ndarray | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -2064,13 +2055,36 @@ def _collect_parquet_axes(
         batch_size=int(batch_size),
         use_threads=True,
     )
-    for batch in scanner.to_batches():
+    read_s = 0.0
+    unique_s = 0.0
+    group: list[pa.RecordBatch] = []
+    batches = scanner.to_batches()
+    while True:
+        step = time.perf_counter()
+        try:
+            batch = next(batches)
+        except StopIteration:
+            read_s += time.perf_counter() - step
+            break
+        read_s += time.perf_counter() - step
         _raise_if_matrix_cancelled(cancel_event)
-        dates.update(pc.unique(_batch_column(batch, "date")).to_pylist())
-        symbols.update(
-            str(value)
-            for value in pc.unique(_batch_column(batch, "symbol")).to_pylist()
-        )
+        group.append(batch)
+        if len(group) < 8:
+            continue
+        step = time.perf_counter()
+        table = pa.Table.from_batches(group)
+        dates.update(pc.unique(table["date"]).to_pylist())
+        symbols.update(str(value) for value in pc.unique(table["symbol"]).to_pylist())
+        unique_s += time.perf_counter() - step
+        group.clear()
+    if group:
+        _raise_if_matrix_cancelled(cancel_event)
+        step = time.perf_counter()
+        table = pa.Table.from_batches(group)
+        dates.update(pc.unique(table["date"]).to_pylist())
+        symbols.update(str(value) for value in pc.unique(table["symbol"]).to_pylist())
+        unique_s += time.perf_counter() - step
+    logger.info("matrix axes scan read_ms=%.1f unique_ms=%.1f", read_s * 1000, unique_s * 1000)
     return sorted(dates), sorted(symbols)
 
 
@@ -2250,9 +2264,6 @@ def make_signal_matrix(
     exit_signal_code: np.ndarray | None = None,
     entry_signal_ids: tuple[str, ...] = (),
     exit_signal_ids: tuple[str, ...] = (),
-    entry_price: np.ndarray | None = None,
-    stop_price: np.ndarray | None = None,
-    take_profit_price: np.ndarray | None = None,
 ) -> SignalMatrix:
     """Create a compact read-only signal matrix with canonical dtypes."""
     entry_array = _coerce_array(entry, shape, np.uint8, 0)
@@ -2268,9 +2279,6 @@ def make_signal_matrix(
         exit_codes,
         entry_signal_ids=entry_signal_ids,
         exit_signal_ids=exit_signal_ids,
-        entry_price=entry_price,
-        stop_price=stop_price,
-        take_profit_price=take_profit_price,
     )
 
 
@@ -2283,13 +2291,9 @@ def _finalize_signal_matrix(
     *,
     entry_signal_ids: tuple[str, ...] = (),
     exit_signal_ids: tuple[str, ...] = (),
-    entry_price: np.ndarray | None = None,
-    stop_price: np.ndarray | None = None,
-    take_profit_price: np.ndarray | None = None,
 ) -> SignalMatrix:
     shape = entry.shape
-    price_arrays = [a for a in (entry_price, stop_price, take_profit_price) if a is not None]
-    _make_read_only(entry, exit_, score, entry_signal_code, exit_signal_code, *price_arrays)
+    _make_read_only(entry, exit_, score, entry_signal_code, exit_signal_code)
     result = SignalMatrix(
         entry=entry,
         exit=exit_,
@@ -2298,9 +2302,6 @@ def _finalize_signal_matrix(
         exit_signal_code=exit_signal_code,
         entry_signal_ids=tuple(entry_signal_ids),
         exit_signal_ids=tuple(exit_signal_ids),
-        entry_price=entry_price,
-        stop_price=stop_price,
-        take_profit_price=take_profit_price,
     )
     validate_signal_matrix(result, shape)
     return result
@@ -2328,24 +2329,6 @@ def validate_signal_matrix(signals: SignalMatrix, shape: tuple[int, int]) -> Non
             raise ValueError(f"SignalMatrix.{name} must be read-only")
     if not np.isfinite(signals.score).all():
         raise ValueError("SignalMatrix.score must contain only finite values")
-    # §4.7-2b 逐格价位 (可选): NaN=无价位, 有限值必须为正价
-    for name in ("entry_price", "stop_price", "take_profit_price"):
-        array = getattr(signals, name)
-        if array is None:
-            continue
-        if not isinstance(array, np.ndarray):
-            raise TypeError(f"SignalMatrix.{name} must be a numpy array")
-        if array.shape != shape:
-            raise ValueError(
-                f"SignalMatrix.{name} shape {array.shape} does not match market {shape}"
-            )
-        if array.dtype != np.dtype(np.float32):
-            raise TypeError(f"SignalMatrix.{name} must use float32, got {array.dtype}")
-        if array.flags.writeable:
-            raise ValueError(f"SignalMatrix.{name} must be read-only")
-        finite = array[np.isfinite(array)]
-        if finite.size and float(finite.min()) <= 0:
-            raise ValueError(f"SignalMatrix.{name} prices must be positive")
 
 
 def build_market_matrix_from_signals(
@@ -2364,15 +2347,6 @@ def build_market_matrix_from_signals(
     validate_signal_matrix(signals, market.shape)
     if entry_price_override is not None and entry_price_override.shape != market.shape:
         raise ValueError("entry_price_override shape does not match MarketDataMatrix")
-    # 逐格介入价不随 entry_delay 平移 (分钟/DSA 路径都是 0 延迟、格子已预放在成交日):
-    # delay=1 时价位与入场格必然错位, 直接拒绝而非静默错位成交。
-    if entry_delay_bars == 1 and (
-        entry_price_override is not None or signals.entry_price is not None
-    ):
-        raise ValueError(
-            "per-cell entry_price requires entry_delay_bars == 0 "
-            "(pre-place signal rows on the fill bar)"
-        )
 
     present = _present_matrix(market.open, market.high, market.low, market.close, market.volume)
     entry, entry_signal_time, entry_signal_code = _delay_signal_matrix(
@@ -2430,20 +2404,6 @@ def build_market_matrix_from_signals(
         entry_signal_code,
         exit_signal_code,
     )
-    # 逐格价位: 显式 kwarg (分钟路径) 优先, 否则取信号矩阵自带 (§4.7-2b DSA 点位)
-    resolved_entry_price = (
-        entry_price_override
-        if entry_price_override is not None
-        else signals.entry_price
-    )
-    resolved_stop_price = signals.stop_price
-    resolved_take_profit_price = signals.take_profit_price
-    copied_prices = []
-    for source in (resolved_entry_price, resolved_stop_price, resolved_take_profit_price):
-        copied = np.array(source, dtype=np.float32, copy=True) if source is not None else None
-        copied_prices.append(copied)
-    resolved_entry_price, resolved_stop_price, resolved_take_profit_price = copied_prices
-    _make_read_only(*[a for a in copied_prices if a is not None])
 
     return MarketMatrix(
         timestamps=market.timestamps,
@@ -2469,9 +2429,11 @@ def build_market_matrix_from_signals(
         exit_signal_code=exit_signal_code,
         entry_signal_ids=signals.entry_signal_ids,
         exit_signal_ids=signals.exit_signal_ids,
-        entry_price=resolved_entry_price,
-        stop_price=resolved_stop_price,
-        take_profit_price=resolved_take_profit_price,
+        entry_price=(
+            np.array(entry_price_override, dtype=np.float32, copy=True)
+            if entry_price_override is not None
+            else None
+        ),
     )
 
 
@@ -2581,15 +2543,6 @@ def slice_signal_matrix(signals: SignalMatrix, start: int, stop: int) -> SignalM
         signals.exit_signal_code[start:stop],
         entry_signal_ids=signals.entry_signal_ids,
         exit_signal_ids=signals.exit_signal_ids,
-        entry_price=(
-            signals.entry_price[start:stop] if signals.entry_price is not None else None
-        ),
-        stop_price=signals.stop_price[start:stop] if signals.stop_price is not None else None,
-        take_profit_price=(
-            signals.take_profit_price[start:stop]
-            if signals.take_profit_price is not None
-            else None
-        ),
     )
 
 
@@ -4275,10 +4228,6 @@ def apply_time_masks(
         exit_codes,
         entry_signal_ids=signals.entry_signal_ids,
         exit_signal_ids=signals.exit_signal_ids,
-        # 逐格价位随行传递; 被 mask 清零的入场格价位留在矩阵里无害 (entry=0 不撮合)
-        entry_price=signals.entry_price,
-        stop_price=signals.stop_price,
-        take_profit_price=signals.take_profit_price,
     )
 
 

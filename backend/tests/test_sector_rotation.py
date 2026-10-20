@@ -617,75 +617,100 @@ def test_rank_reference_counts_trading_minutes_across_lunch(tmp_path):
     assert a["rank_prev"] == 1 and a["rank_change"] == -1
 
 
-def test_live_snapshot_cache_restart_and_rollover(repo, monkeypatch):
-    from app.market_time import CN_TZ
-    from app.services import rotation_snapshots as snapshots
-    now = datetime(2026, 10, 8, 14, 20, tzinfo=CN_TZ)
-    monkeypatch.setattr(snapshots, "cn_now", lambda: now)
-    records = [{"symbol": symbol, "last_price": 110., "prev_close": 100.,
-                "timestamp": now.timestamp() * 1000} for symbol in SYMS_A + SYMS_B]
-    snapshots.capture(repo.store.data_dir, records, now)
-    result = sector_rotation.build_sector_rotation(repo)
-    assert result["source"] == "quote_snapshot"
-    assert result["date"] == "2026-10-08"
-    assert result["sample_started_at"] == "14:20"
-    assert result["sectors"][0]["pct_now"] == pytest.approx(.1)
-    records[0]["last_price"] = 120.
-    snapshots.capture(repo.store.data_dir, records, now)
-    assert sector_rotation.build_sector_rotation(repo)["sectors"][0]["pct_now"] == pytest.approx(.15)
-    snapshots._pending.join()
-    with snapshots._lock:
-        snapshots._latest.pop(repo.store.data_dir.resolve())
-    sector_rotation.invalidate_cache()
-    assert sector_rotation.build_sector_rotation(repo)["source"] == "quote_snapshot"
-    tomorrow = datetime(2026, 10, 9, 9, 40, tzinfo=CN_TZ)
-    monkeypatch.setattr(snapshots, "cn_now", lambda: tomorrow)
-    assert sector_rotation.build_sector_rotation(repo)["date"] == DAY
-    snapshots.capture(repo.store.data_dir, records, tomorrow)
-    assert snapshots.read_today(repo.store.data_dir) is None
+# ---- GH #473: 单股分钟脏点不得带飞板块曲线 ----
+
+def test_dirty_minute_point_does_not_explode_sector_pct(tmp_path):
+    """脏 close (某分钟价为前收 19 倍) 被剔除, 板块 pct 保持正常量级。
+
+    复现 issue #473: 租赁同权 tooltip 1795.96% — 小板块被单只脏点经等权
+    均值带飞。过滤后矩阵/榜单最大值应 < 100%。"""
+    from datetime import datetime as _dt
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    stamps = [_dt.fromisoformat(f"{DAY}T09:{30 + i:02d}:00") for i in range(5)]
+    rows = []
+    for ts in stamps:
+        rows.append({"symbol": "000001.SZ", "datetime": ts, "close": 102.0})
+        # 脏点: 第二根分钟价跳到前收的 19 倍
+        dirty = 1900.0 if ts == stamps[1] else 102.0
+        rows.append({"symbol": "000002.SZ", "datetime": ts, "close": dirty})
+    for ts in stamps:
+        for sym in SYMS_B:
+            rows.append({"symbol": sym, "datetime": ts, "close": 100.5})
+    (data_dir / "kline_minute" / f"date={DAY}").mkdir(parents=True)
+    pl.DataFrame(rows).write_parquet(data_dir / "kline_minute" / f"date={DAY}" / "part.parquet")
+    _write_prev_daily(data_dir)
+    _write_concept_ext(data_dir)
+    repo = SimpleNamespace(store=SimpleNamespace(data_dir=data_dir))
+    _reset_caches()
+
+    result = sector_rotation.build_sector_rotation(repo, kind="concept", bucket_minutes=5)
+    _reset_caches()
+
+    assert result["status"] == "ok"
+    sectors = {item["name"]: item for item in result["sectors"]}
+    assert abs(sectors["A题材"]["pct_now"]) < 1.0
+    matrix = result["series"]["matrix"]
+    flat = [v for row in matrix for v in row if v is not None]
+    assert flat and max(abs(v) for v in flat) < 1.0
 
 
-def test_snapshot_empty_invalid_and_corrupt_fall_back(repo, monkeypatch):
-    from app.market_time import CN_TZ
-    from app.services import rotation_snapshots as snapshots
-    now = datetime(2026, 10, 8, 14, 20, tzinfo=CN_TZ)
-    monkeypatch.setattr(snapshots, "cn_now", lambda: now)
-    snapshots.capture(repo.store.data_dir, [], now)
-    snapshots.capture(repo.store.data_dir, [{"symbol": SYMS_A[0], "last_price": float("nan"),
-                                           "change_pct": .1}], now)
-    directory = repo.store.data_dir / "rotation_snapshots" / "date=2026-10-08"
-    directory.mkdir(parents=True)
-    (directory / "1420.parquet").write_bytes(b"bad")
-    assert sector_rotation.build_sector_rotation(repo)["source"] == "minute_history"
-    assert sector_rotation.build_sector_rotation(repo)["date"] == DAY
+def test_limit_up_down_minutes_are_kept(tmp_path):
+    """涨跌停 (±10%/±20%) 在物理边界内, 不得被当脏点剔除。"""
+    from datetime import datetime as _dt
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    stamps = [_dt.fromisoformat(f"{DAY}T09:{30 + i:02d}:00") for i in range(5)]
+    rows = []
+    for ts in stamps:
+        rows.append({"symbol": "000001.SZ", "datetime": ts, "close": 110.0})  # +10% 涨停
+        rows.append({"symbol": "000002.SZ", "datetime": ts, "close": 80.0})   # -20% 跌停
+    for ts in stamps:
+        for sym in SYMS_B:
+            rows.append({"symbol": sym, "datetime": ts, "close": 100.5})
+    (data_dir / "kline_minute" / f"date={DAY}").mkdir(parents=True)
+    pl.DataFrame(rows).write_parquet(data_dir / "kline_minute" / f"date={DAY}" / "part.parquet")
+    _write_prev_daily(data_dir)
+    _write_concept_ext(data_dir)
+    repo = SimpleNamespace(store=SimpleNamespace(data_dir=data_dir))
+    _reset_caches()
+
+    result = sector_rotation.build_sector_rotation(repo, kind="concept", bucket_minutes=5)
+    _reset_caches()
+
+    assert result["status"] == "ok"
+    sectors = {item["name"]: item for item in result["sectors"]}
+    # A 题材 = (+10% + -20%) / 2 = -5%
+    assert sectors["A题材"]["pct_now"] == pytest.approx(-0.05, abs=1e-4)
 
 
-@pytest.mark.parametrize("offset", [-121, 121])
-def test_snapshot_rejects_stale_or_future_quote(repo, monkeypatch, offset):
-    from datetime import timedelta
+def test_physical_boundary_value_kept(tmp_path):
+    """边界值 ±30% 恰好保留 (北交所涨跌停上限)。"""
+    from datetime import datetime as _dt
 
-    from app.market_time import CN_TZ
-    from app.services import rotation_snapshots as snapshots
-    now = datetime(2026, 10, 8, 14, 20, tzinfo=CN_TZ)
-    monkeypatch.setattr(snapshots, "cn_now", lambda: now)
-    snapshots.capture(repo.store.data_dir, [{"symbol": SYMS_A[0], "last_price": 110.,
-        "prev_close": 100., "timestamp": (now + timedelta(seconds=offset)).timestamp()*1000}], now)
-    assert snapshots.read_today(repo.store.data_dir) is None
-    assert sector_rotation.build_sector_rotation(repo)["date"] == DAY
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    stamps = [_dt.fromisoformat(f"{DAY}T09:{30 + i:02d}:00") for i in range(2)]
+    rows = []
+    for ts in stamps:
+        rows.append({"symbol": "000001.SZ", "datetime": ts, "close": 130.0})  # +30%
+        rows.append({"symbol": "000002.SZ", "datetime": ts, "close": 70.0})   # -30%
+    for ts in stamps:
+        for sym in SYMS_B:
+            rows.append({"symbol": sym, "datetime": ts, "close": 100.5})
+    (data_dir / "kline_minute" / f"date={DAY}").mkdir(parents=True)
+    pl.DataFrame(rows).write_parquet(data_dir / "kline_minute" / f"date={DAY}" / "part.parquet")
+    _write_prev_daily(data_dir)
+    _write_concept_ext(data_dir)
+    repo = SimpleNamespace(store=SimpleNamespace(data_dir=data_dir))
+    _reset_caches()
 
+    result = sector_rotation.build_sector_rotation(repo, kind="concept", bucket_minutes=5)
+    _reset_caches()
 
-def test_snapshot_accepts_reasonable_source_clock_skew(repo, monkeypatch):
-    from datetime import timedelta
-
-    from app.market_time import CN_TZ
-    from app.services import rotation_snapshots as snapshots
-
-    now = datetime(2026, 10, 8, 14, 20, tzinfo=CN_TZ)
-    monkeypatch.setattr(snapshots, "cn_now", lambda: now)
-    snapshots.capture(repo.store.data_dir, [{"symbol": SYMS_A[0], "last_price": 110.,
-        "prev_close": 100., "timestamp": (now + timedelta(seconds=60)).timestamp()*1000}], now)
-    result = sector_rotation.build_sector_rotation(repo)
-    assert result["source"] == "quote_snapshot"
-    assert result["date"] == "2026-10-08"
-    assert result["sectors"][0]["pct_now"] == pytest.approx(.1)
-    snapshots._pending.join()
+    assert result["status"] == "ok"
+    sectors = {item["name"]: item for item in result["sectors"]}
+    # A 题材 = (+30% + -30%) / 2 = 0
+    assert sectors["A题材"]["pct_now"] == pytest.approx(0.0, abs=1e-4)

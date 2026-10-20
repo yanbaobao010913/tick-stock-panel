@@ -54,14 +54,11 @@ class _FakeFinClient:
 
 
 def _provider_with(monkeypatch, fake):
-    fp._reset_financial_state()
     monkeypatch.setattr(
         fp, "fuyao_client", type("M", (), {"FuyaoClient": lambda **kw: fake})
     )
     monkeypatch.setattr(fp, "get_api_key", lambda: "test-key")
     monkeypatch.setattr(fp, "_HIST_INTERVAL_S", 0)
-    # 测试不限速: 节奏器直接用上限速率, 避免 AIMD 发牌在断言里引入真实 sleep
-    monkeypatch.setattr(fp, "_AIMD_RATE_CAP", 1e9)
     return FuyaoProvider()
 
 
@@ -232,6 +229,81 @@ def test_metrics_indicator_failure_keeps_row(monkeypatch):
     assert "roe" not in df.columns
 
 
+class _PerSymbolMetricsClient(_FakeFinClient):
+    """按标的返回不同利润表行与指标, 模拟全市场同步的逐股稀疏出现。"""
+
+    def __init__(
+        self,
+        rows_by_symbol: dict[str, dict],
+        indicators_by_symbol: dict[str, list[dict]],
+    ):
+        super().__init__()
+        self.rows_by_symbol = rows_by_symbol
+        self.indicators_by_symbol = indicators_by_symbol
+
+    def financial_statements(self, stmt, thscode, limit=1):
+        self.stmt_calls.append((stmt, thscode, limit))
+        return [dict(self.rows_by_symbol[thscode], thscode=thscode)]
+
+    def financial_indicators(self, thscode, report):
+        self.ind_calls.append(f"{thscode}@{report}")
+        return self.indicators_by_symbol.get(thscode, [])
+
+
+def test_metrics_sparse_column_after_100_rows(monkeypatch):
+    """前 100 只只有公共指标、之后才出现行业特有指标时, 列不得丢失或崩溃。
+
+    真实场景 (#458): custom 数据源全市场同步一次传入数千只, 不分批;
+    行业特有指标 (如仅银行披露的 financial_expense) 前 100 行的 row 里完全
+    没有该键 (值非 None 才写列), 裸 pl.DataFrame 默认按前 100 行采样推断,
+    该列被静默丢弃 —— 指标值消失且无任何异常; 公共列 (eps_basic) 前 100 行
+    为 None、之后才有值时则直接 ComputeError 整表构建失败。本用例同时覆盖
+    两种形态。
+    """
+    common = {
+        "ability": "profitability",
+        "indicators": [{"index_id": "index_weighted_avg_roe", "value": "10.5"}],
+    }
+    # 前 100 只: 无 basic_eps (eps_basic=None), 仅公共指标 roe
+    rows_by_symbol = {
+        f"{600000 + i:06d}.SH": dict(_INCOME_ROW, basic_eps=None)
+        for i in range(100)
+    }
+    indicators_by_symbol = {
+        f"{600000 + i:06d}.SH": [common] for i in range(100)
+    }
+    # 第 101 只 (银行): basic_eps 有值 + 行业特有指标首次出现
+    rows_by_symbol["601998.SH"] = dict(_INCOME_ROW, basic_eps=2.31)
+    indicators_by_symbol["601998.SH"] = [
+        {
+            "ability": "profitability",
+            "indicators": [
+                {"index_id": "index_weighted_avg_roe", "value": "11.2"},
+                {"index_id": "financial_expense", "value": "61199000000.0"},
+            ],
+        },
+    ]
+    provider = _provider_with(
+        monkeypatch, _PerSymbolMetricsClient(rows_by_symbol, indicators_by_symbol)
+    )
+
+    df = provider.get_financials("metrics", list(rows_by_symbol), latest_only=True)
+
+    assert df.height == 101
+    # 稀疏列不再被静默丢弃 (修复前: 该列直接从结果中消失, 无异常)
+    assert "financial_expense" in df.columns
+    assert df.schema["financial_expense"] == pl.Float64
+    bank = df.filter(pl.col("symbol") == "601998.SH").row(0, named=True)
+    assert bank["financial_expense"] == pytest.approx(6.1199e10)
+    assert (
+        df.filter(pl.col("symbol") != "601998.SH")["financial_expense"].null_count()
+        == 100
+    )
+    # 公共列 None→值 不再触发 ComputeError (修复前: "could not append value")
+    assert df.schema["eps_basic"] == pl.Float64
+    assert bank["eps_basic"] == 2.31
+
+
 def test_metrics_skips_symbol_without_income(monkeypatch):
     fake = _FakeFinClient(statements={"income": []})
     provider = _provider_with(monkeypatch, fake)
@@ -241,97 +313,6 @@ def test_metrics_skips_symbol_without_income(monkeypatch):
 def test_shares_returns_empty(monkeypatch):
     provider = _provider_with(monkeypatch, _FakeFinClient())
     assert provider.get_financials("shares", ["600519.SH"]).is_empty()
-
-
-class _UnknownCodeClient(_FakeFinClient):
-    """指定标的返回 code=1002 (退市/特殊状态, 服务端不认识)。"""
-
-    def __init__(self, unknown: set[str]):
-        super().__init__()
-        self.unknown = unknown
-
-    def financial_statements(self, stmt, thscode, limit=1):
-        self.stmt_calls.append((stmt, thscode, limit))
-        if thscode in self.unknown:
-            raise fc.FuyaoError(f"code=1002: Unknown thscode: {thscode}", code=1002)
-        return [_INCOME_ROW]
-
-
-def test_client_envelope_error_carries_code(monkeypatch):
-    """信封 code 必须落到 FuyaoError.code —— 负面缓存/限频退避全靠它分流。"""
-    class _Resp:
-        status_code = 200
-
-        def json(self):
-            return {"code": 1002, "message": "Unknown thscode", "data": None}
-
-    monkeypatch.setattr("httpx.Client.get", lambda self, path, params=None: _Resp())
-    client = fc.FuyaoClient(api_key="k")
-    with pytest.raises(fc.FuyaoError) as ei:
-        client.financial_statements("income", "999999.SZ")
-    assert ei.value.code == 1002
-
-
-def test_unknown_code_negative_cache_skips_later_tables(monkeypatch):
-    """1002 标的记入负面缓存: 同一轮后续表同步不再重发注定失败的请求。"""
-    fake = _UnknownCodeClient(unknown={"999999.SZ"})
-    provider = _provider_with(monkeypatch, fake)
-    df = provider.get_financials("income", ["600519.SH", "999999.SZ"], latest_only=True)
-    assert df.height == 1  # 失败标的缺数, 正常标的照写
-    assert fp._unknown_code_skip("999999.SZ")
-    calls_after_income = len(fake.stmt_calls)
-    provider.get_financials("balance_sheet", ["600519.SH", "999999.SZ"])
-    new_calls = fake.stmt_calls[calls_after_income:]
-    assert all(sym != "999999.SZ" for _, sym, _ in new_calls)  # 只剩正常标的的请求
-
-
-def test_metrics_reuses_income_probe(monkeypatch):
-    """同一轮 income 表同步后, metrics 反查直接复用缓存, 不重发 income 请求。"""
-    fake = _FakeFinClient(
-        statements={"income": [_INCOME_ROW]},
-        indicators={"2026-2": _METRICS_ABILITIES},
-        valuations=[{"thscode": "600519.SH", "pb_mrq": 6.455055}],
-        prices=[{"thscode": "600519.SH", "last_price": 1297.4}],
-    )
-    provider = _provider_with(monkeypatch, fake)
-    provider.get_financials("income", ["600519.SH"], latest_only=True)
-    calls_after_income = len(fake.stmt_calls)
-    df = provider.get_financials("metrics", ["600519.SH"])
-    assert df.to_dicts()[0]["roe"] == pytest.approx(16.75)  # 复用缓存组装结果不变
-    assert len(fake.stmt_calls) == calls_after_income  # income 零重发
-    assert fake.ind_calls == ["600519.SH@2026-2"]  # 指标请求照发
-
-
-def test_adaptive_pacer_aimd_bounds():
-    """AIMD 数学: 连续成功提速 25%、撞限频减半、下限钉在起点、上限封顶。"""
-    pacer = fp._AdaptivePacer(10.0)
-    for _ in range(fp._AIMD_ACCEL_WINDOW):
-        pacer.on_success()
-    assert pacer._rate == pytest.approx(12.5)
-    pacer.on_throttled()
-    assert pacer._rate == pytest.approx(10.0)  # 12.5×0.5=6.25 → 不低于实测安全起点
-    capped = fp._AdaptivePacer(fp._AIMD_RATE_CAP * 0.9)
-    for _ in range(fp._AIMD_ACCEL_WINDOW):
-        capped.on_success()
-    assert capped._rate == pytest.approx(fp._AIMD_RATE_CAP)  # 0.9×1.25=1.125 → 封顶
-
-
-def test_concurrent_requests_preserve_row_semantics(monkeypatch):
-    """并发改造后逐股语义不变: 部分失败跳过、成功行齐全、列口径不漂移。"""
-    class _FlakyClient(_FakeFinClient):
-        def financial_statements(self, stmt, thscode, limit=1):
-            self.stmt_calls.append((stmt, thscode, limit))
-            if thscode.endswith("0002.SH"):
-                raise fc.FuyaoError("网络请求失败: boom")  # 非 1002/4001 → 跳过
-            return [dict(_INCOME_ROW, thscode=thscode)]
-
-    syms = [f"60000{i}.SH" for i in range(1, 6)]
-    fake = _FlakyClient()
-    provider = _provider_with(monkeypatch, fake)
-    df = provider.get_financials("income", syms, latest_only=True)
-    assert df.height == 4  # 失败 1 只, 其余齐全
-    assert df["symbol"].to_list() == [s for s in syms if s != "600002.SH"]
-    assert df.schema["basic_eps"] == pl.Float64
 
 
 def test_merge_fills_missing_cells_from_old_rows():
