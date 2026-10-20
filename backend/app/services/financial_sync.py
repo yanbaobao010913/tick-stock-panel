@@ -8,12 +8,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
-from app.polars_guard import collect_slot
 from app.services.fs_utils import atomic_write_parquet
 from app.tickflow.capabilities import Cap, CapabilitySet
 
@@ -24,11 +24,6 @@ _BATCH_SIZE = 100
 
 # 财务报表 + 历史股本表
 FINANCIAL_TABLES = ("metrics", "income", "balance_sheet", "cash_flow", "shares")
-
-# 全量同步的执行顺序: income 必须先于 metrics —— fuyao 的 metrics 需先用利润表
-# limit=1 反查每股最新披露期, income 先同步时 provider 会缓存该结果直接复用,
-# 全市场每股省一次请求。其余消费方(恢复/兜底遍历)仍用 FINANCIAL_TABLES, 顺序无关。
-_SYNC_ORDER = ("income", "balance_sheet", "cash_flow", "metrics", "shares")
 
 
 # ================================================================
@@ -41,10 +36,7 @@ def _get_symbols(data_dir: Path) -> list[str]:
     if not inst_path.exists():
         return []
     try:
-        # Polars 并发闸: 同步线程的 collect 与行情轮询等并发时共用共享执行池,
-        # 不经闸会触发上游 rayon 池死锁(2026-09-30 实测全进程冻结 29 分钟)。
-        with collect_slot("background"):
-            df = pl.read_parquet(inst_path, columns=["symbol"])
+        df = pl.read_parquet(inst_path, columns=["symbol"])
         return df["symbol"].to_list()
     except Exception as e:
         logger.warning("读取 instruments 失败: %s", e)
@@ -61,6 +53,13 @@ def _financial_is_custom() -> bool:
     return custom_sources.provider_has_dataset(provider, "financial")
 
 
+def _financial_capability_label() -> str:
+    """门禁日志标签: "财务数据 ← fuyao" / "…(档位不足)", 便于判断该切哪个源。"""
+    from app.data_providers.capabilities import capability_gate
+    _, label = capability_gate("financial")
+    return label
+
+
 def _fetch_table(
     table: str,
     symbols: list[str],
@@ -70,7 +69,7 @@ def _fetch_table(
     """通过当前财务数据源拉取一张标准化财务表。"""
     is_custom = _financial_is_custom()
     if not is_custom and not capset.has(Cap.FINANCIAL):
-        logger.info("sync_%s skipped: no FINANCIAL capability", table)
+        logger.info("sync_%s skipped: %s 不可用", table, _financial_capability_label())
         return pl.DataFrame()
     if not symbols:
         logger.warning("sync_%s skipped: no symbols", table)
@@ -78,12 +77,12 @@ def _fetch_table(
 
     # 自定义数据源分流
     if is_custom:
-        from app.data_providers import custom as custom_sources
         from app.services import preferences
+        from app.data_providers import custom as custom_sources
         try:
             provider = custom_sources.get_provider(preferences.get_financial_provider())
             df = provider.get_financials(table, symbols, latest_only=latest_only)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("sync_%s custom provider failed: %s", table, e)
             return pl.DataFrame()
         if df.is_empty() or "symbol" not in df.columns:
@@ -179,11 +178,10 @@ def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
     ]
     if not valid:
         return pl.DataFrame()
-    with collect_slot("background"):
-        merged = (
-            pl.concat(valid, how="diagonal_relaxed")
-            .filter(pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null())
-        )
+    merged = (
+        pl.concat(valid, how="diagonal_relaxed")
+        .filter(pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null())
+    )
     sort_keys = ["symbol", "period_end"] + (
         ["announce_date"] if "announce_date" in merged.columns else []
     )
@@ -260,12 +258,12 @@ def sync_shares(data_dir: Path, capset: CapabilitySet) -> int:
 def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
     """同步所有财务表。返回 {table: rows}。"""
     if not capset.has(Cap.FINANCIAL) and not _financial_is_custom():
-        logger.info("sync_all financials skipped: no FINANCIAL capability")
+        logger.info("sync_all financials skipped: %s 不可用", _financial_capability_label())
         return {}
 
     symbols = _get_symbols(data_dir)
     results: dict[str, int] = {}
-    for table in _SYNC_ORDER:
+    for table in FINANCIAL_TABLES:
         results[table] = _sync_history_table_for_symbols(
             table, symbols, data_dir, capset
         )
@@ -304,8 +302,7 @@ def get_financial_df(data_dir: Path, table: str) -> pl.DataFrame:
     if not path.exists():
         return pl.DataFrame()
     try:
-        with collect_slot("background"):
-            return pl.read_parquet(path)
+        return pl.read_parquet(path)
     except Exception as e:
         logger.warning("读取 financials/%s 失败: %s", table, e)
         return pl.DataFrame()
@@ -342,7 +339,7 @@ class FinancialScheduler:
         self._data_dir = data_dir
         self._capset = capset
         if not capset.has(Cap.FINANCIAL) and not _financial_is_custom():
-            logger.info("FinancialScheduler skipped: no FINANCIAL capability")
+            logger.info("FinancialScheduler skipped: %s 不可用", _financial_capability_label())
             return
         # 从持久化恢复上次同步时间: 重启后前端仍能显示真实最后同步时间,而非"尚未同步"
         try:
@@ -355,14 +352,14 @@ class FinancialScheduler:
                     continue
                 parquet = data_dir / "financials" / table / "part.parquet"
                 if parquet.exists():
-                    mtime = datetime.fromtimestamp(parquet.stat().st_mtime, tz=UTC).isoformat()
+                    mtime = datetime.fromtimestamp(parquet.stat().st_mtime, tz=timezone.utc).isoformat()
                     restored[table] = mtime
                     preferences.set_financial_sync_time(table, mtime)
                     logger.info("FinancialScheduler backfilled last_sync for %s from parquet mtime", table)
             self._last_sync = restored
             if self._last_sync:
                 logger.info("FinancialScheduler restored last_sync: %s", list(self._last_sync.keys()))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("restore financial_sync_times failed: %s", e)
 
         if not auto_schedule:
@@ -380,12 +377,12 @@ class FinancialScheduler:
         持久化确保即使重启,前端 /status 仍返回真实的最后同步时间,
         不会错误地显示"尚未同步"。
         """
-        ts = datetime.now(UTC).isoformat()
+        ts = datetime.now(timezone.utc).isoformat()
         self._last_sync[table] = ts
         try:
             from app.services import preferences
             preferences.set_financial_sync_time(table, ts)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("persist financial_sync_time(%s) failed: %s", e)
 
     def update_capabilities(self, capset: CapabilitySet) -> None:
@@ -460,7 +457,7 @@ class FinancialScheduler:
         # 全部同步
         symbols = _get_symbols(self._data_dir)
         result: dict[str, int] = {}
-        for t in _SYNC_ORDER:
+        for t in FINANCIAL_TABLES:
             result[t] = _sync_history_table_for_symbols(
                 t, symbols, self._data_dir, self._capset
             )
@@ -515,7 +512,7 @@ class FinancialScheduler:
         def _bg() -> None:
             try:
                 self._run_body(table)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.exception("background financial sync failed: %s", e)
             finally:
                 with self._lock:

@@ -646,7 +646,8 @@ function shortenIndexNames(text: string): string {
 const _INDEX_PCT_RE = /([上深创科])([+-]?\d+\.\d+%)/g
 function parseIndexPcts(indexSegment: string): { name: string; pctStr: string; pctNum: number }[] {
   const out: { name: string; pctStr: string; pctNum: number }[] = []
-  for (const m of indexSegment.matchAll(_INDEX_PCT_RE)) {
+  for (
+const m of indexSegment.matchAll(_INDEX_PCT_RE)) {
     out.push({ name: m[1], pctStr: m[2], pctNum: parseFloat(m[2]) })
   }
   return out

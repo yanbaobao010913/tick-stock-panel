@@ -237,7 +237,8 @@ export function ListColumnCustomizerInner({
   const colById = useMemo(() => new Map(columns.map(c => [c.id, c])), [columns])
   const keyToId = useMemo(() => {
     const m = new Map<string, string>()
-    for (const c of columns) {
+    for (
+const c of columns) {
       if (c.source.type === 'builtin' || c.source.type === 'computed') m.set(c.source.key, c.id)
     }
     return m

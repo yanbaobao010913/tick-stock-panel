@@ -730,11 +730,14 @@ function RulesList({ rulesQuery, onEdit }: {
   })
   const groupMeta = useMemo(() => {
     const meta: Record<string, { name: string; color: string; count: number }> = {}
-    for (const g of groupsQ.data?.groups ?? []) {
+    for (
+const g of groupsQ.data?.groups ?? []) {
       meta[g.id] = { name: g.name, color: g.color, count: 0 }
     }
-    for (const entry of watchlistQ.data?.symbols ?? []) {
-      for (const gid of entry.group_ids ?? []) {
+    for (
+const entry of watchlistQ.data?.symbols ?? []) {
+      for (
+const gid of entry.group_ids ?? []) {
         if (meta[gid]) meta[gid].count += 1
       }
     }
@@ -744,7 +747,8 @@ function RulesList({ rulesQuery, onEdit }: {
   // 收集所有规则的股票代码, 批量查名称
   const allSymbols = useMemo(() => {
     const set = new Set<string>()
-    for (const r of rules) {
+    for (
+const r of rules) {
       if (r.scope === 'symbols') r.symbols.forEach(s => set.add(s))
     }
     return Array.from(set)

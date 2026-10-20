@@ -13,7 +13,8 @@ pnpm install && pnpm build      # → dist/extension.js
 
 ## 产物契约 (apiVersion 1)
 
-产物必须 `export default` 一个清单对象：
+产物必须 `
+export default` 一个清单对象：
 
 ```tsx
 const extension = {

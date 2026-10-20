@@ -91,7 +91,8 @@ function pickBestConfig(
   // 且「未获取」引导按钮因 id 不匹配而不渲染)。预设存在时直接用它。
   if (configs.some(c => c.id === PRESET_INDUSTRY_ID)) return PRESET_INDUSTRY_ID
   let best = '', bestScore = 0
-  for (const c of configs) {
+  for (
+const c of configs) {
     const haystack = [c.id, c.label, c.description ?? '', ...c.fields.flatMap(f => [f.name, f.label])].join(' ').toLowerCase()
     const score = KEYWORDS.reduce((n, k) => n + (haystack.includes(k) ? 1 : 0), 0)
     if (score > bestScore) { bestScore = score; best = c.id }
@@ -110,8 +111,10 @@ function symbolKeys(symbol: unknown): string[] {
 
 function buildMarketMap(rows: MarketSnapshotRow[]) {
   const map = new Map<string, MarketSnapshotRow>()
-  for (const r of rows) {
-    for (const key of symbolKeys(r.symbol)) map.set(key, r)
+  for (
+const r of rows) {
+    for (
+const key of symbolKeys(r.symbol)) map.set(key, r)
   }
   return map
 }
@@ -259,7 +262,8 @@ function industryLevelName(key: string, level: IndustryLevel) {
 
 function groupByIndustryLevel(groups: DimensionGroup[], level: IndustryLevel): DimensionGroup[] {
   const map = new Map<string, DimensionGroup>()
-  for (const group of groups) {
+  for (
+const group of groups) {
     const key = industryLevelName(group.key, level)
     const existing = map.get(key)
     if (existing) {
@@ -374,7 +378,8 @@ export function IndustryAnalysis() {
   // 热力图用的 quoteMap（兼容 DimensionHeatmap 组件接口）
   const heatmapQuoteMap = useMemo(() => {
     const map = new Map<string, { symbol: string; pct?: number; change_pct?: number; name?: string; [k: string]: unknown }>()
-    for (const [k, v] of marketMap) {
+    for (
+const [k, v] of marketMap) {
       map.set(k, {
         ...v,
         change_pct: v.change_pct ?? undefined,

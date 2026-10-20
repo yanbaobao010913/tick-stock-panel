@@ -164,7 +164,8 @@ it('trading page exposes full risk fields and save carries them', async () => {
   act(() => { findButton('风控触发').click() })
 
   // 与回测抽屉同构的 6 项纪律字段
-  for (const label of ['止损', '止盈', '移动止损', '回撤止盈启动', '回撤止盈回撤', '最长持仓']) {
+  for (
+const label of ['止损', '止盈', '移动止损', '回撤止盈启动', '回撤止盈回撤', '最长持仓']) {
     expect([...container.querySelectorAll('span')].some(s => s.textContent === label)).toBe(true)
   }
 

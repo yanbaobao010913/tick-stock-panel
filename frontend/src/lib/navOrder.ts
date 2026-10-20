@@ -57,6 +57,7 @@ export function seedHiddenForNewUser(
 ): string[] | null {
   if (onboardingCompleted !== false) return null
   const hidden = new Set(currentHidden ?? [])
-  for (const p of EXT_DOMAIN_PAGE_PATHS) hidden.add(p)
+  for (
+const p of EXT_DOMAIN_PAGE_PATHS) hidden.add(p)
   return [...hidden]
 }

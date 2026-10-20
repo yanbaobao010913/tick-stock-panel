@@ -82,12 +82,14 @@ export function PicksSymbolKlineModal({ symbol, result, periodStart, periodEnd, 
       const range = s.lo === s.hi ? fmtPrice(s.lo) : `${fmtPrice(s.lo)}~${fmtPrice(s.hi)}`
       return s.count > 1 ? `${range} ×${s.count}` : range
     }
-    for (const t of trades) {
+    for (
+const t of trades) {
       add(String(t.entry_date).slice(0, 10), 'buy', Number(t.entry_price))
       add(String(t.exit_date).slice(0, 10), 'sell', Number(t.exit_price))
     }
     const out: ChartMarker[] = []
-    for (const [date, g] of byDate) {
+    for (
+const [date, g] of byDate) {
       if (g.buy) out.push({ date, kind: 'buy', label: label(g.buy) })
       if (g.sell) out.push({ date, kind: 'sell', label: label(g.sell) })
     }

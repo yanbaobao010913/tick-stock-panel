@@ -88,7 +88,8 @@ function pickBestConfig(
   if (configs.some(c => c.id === PRESET_CONCEPT_ID)) return PRESET_CONCEPT_ID
   let best = ''
   let bestScore = 0
-  for (const c of configs) {
+  for (
+const c of configs) {
     const haystack = [c.id, c.label, c.description ?? '', ...c.fields.flatMap(f => [f.name, f.label])].join(' ').toLowerCase()
     const score = KEYWORDS.reduce((n, k) => n + (haystack.includes(k) ? 1 : 0), 0)
     if (score > bestScore) {
@@ -108,8 +109,10 @@ function symbolKeys(symbol: unknown): string[] {
 
 function buildMarketMap(rows: MarketSnapshotRow[]) {
   const map = new Map<string, MarketSnapshotRow>()
-  for (const r of rows) {
-    for (const key of symbolKeys(r.symbol)) map.set(key, r)
+  for (
+const r of rows) {
+    for (
+const key of symbolKeys(r.symbol)) map.set(key, r)
   }
   return map
 }

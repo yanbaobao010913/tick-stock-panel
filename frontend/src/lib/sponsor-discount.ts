@@ -66,9 +66,11 @@ export function fmtFold(rate: number): string {
 export function discountRangeLabel(items: SponsorModelItem[], family = 'deepseek'): string | null {
   const needle = family.toLowerCase()
   const rates: number[] = []
-  for (const m of items) {
+  for (
+const m of items) {
     if (!m.id.toLowerCase().includes(needle)) continue
-    for (const rate of [m.busy_discount_rate, m.offpeak_discount_rate, m.discount_rate]) {
+    for (
+const rate of [m.busy_discount_rate, m.offpeak_discount_rate, m.discount_rate]) {
       if (rate != null && Number.isFinite(rate) && rate > 0 && rate < 1) rates.push(rate)
     }
   }
@@ -90,8 +92,10 @@ export function bandDiscountLabel(m: SponsorModelItem): string | null {
 /** 全站最大优惠百分比: 最低折扣 0.3 → 70; 无折扣数据 → null */
 export function maxDiscountPct(items: SponsorModelItem[]): number | null {
   const rates: number[] = []
-  for (const m of items) {
-    for (const rate of [m.busy_discount_rate, m.offpeak_discount_rate, m.discount_rate]) {
+  for (
+const m of items) {
+    for (
+const rate of [m.busy_discount_rate, m.offpeak_discount_rate, m.discount_rate]) {
       if (rate != null && Number.isFinite(rate) && rate > 0 && rate < 1) rates.push(rate)
     }
   }

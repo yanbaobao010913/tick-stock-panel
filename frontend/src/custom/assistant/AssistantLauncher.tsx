@@ -9,6 +9,7 @@ import { useEffect } from 'react'
 import type { FrontendSlotContextMap } from '@/extensions/types'
 import { closeAssistant, setPageContext, toggleAssistant, useAssistantStore } from './store'
 import { AssistantFloatingButton } from './ui/AssistantFloatingButton'
+import { AiConfigEntry } from './ui/AiConfigEntry'
 import { AssistantDrawer } from './ui/AssistantDrawer'
 
 // 插槽注册表把组件 props 定为所有插槽上下文的联合类型(保守契约);
@@ -63,6 +64,7 @@ export function AssistantLauncher(props: AnySlotContext) {
   return (
     <>
       <AssistantFloatingButton />
+      <AiConfigEntry />
       <AssistantDrawer />
     </>
   )

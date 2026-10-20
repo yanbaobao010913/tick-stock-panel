@@ -58,7 +58,8 @@ export function paramDisplayLabel(p: StrategyParamDef): string {
 
 export function groupParams(params: StrategyParamDef[]): ParamGroup[] {
   const groups: ParamGroup[] = []
-  for (const p of params) {
+  for (
+const p of params) {
     const name = p.group ?? null
     const last = groups[groups.length - 1]
     if (last && last.name === name) last.items.push(p)

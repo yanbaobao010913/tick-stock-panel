@@ -78,7 +78,8 @@ function buildModel(sessions: MinuteKlineSession[]) {
     // 量柱着色基准: 前一分钟 close; 当日第一根用 session 昨收。
     // 不用 row.open — 部分分钟源历史日无真实 open(为 null), close-vs-open 会全偏。
     let prevRef: number | null = session.prev_close
-    for (const time of FULL_DAY_TIMES) {
+    for (
+const time of FULL_DAY_TIMES) {
       const point = rowsByTime.get(time)
       const index = categories.length
       categories.push(`${session.date} ${time}`)

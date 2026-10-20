@@ -83,7 +83,8 @@ export function Lots() {
   })
   const lastPrices = useMemo(() => {
     const m: Record<string, number> = {}
-    for (const [sym, rows] of Object.entries(dailyQuery.data?.data ?? {})) {
+    for (
+const [sym, rows] of Object.entries(dailyQuery.data?.data ?? {})) {
       const last = rows[rows.length - 1]
       if (last?.close != null) m[sym] = Number(last.close)
     }

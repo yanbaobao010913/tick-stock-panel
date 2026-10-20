@@ -102,7 +102,8 @@ function subscribe(fn: () => void) {
 
 function buildQuery(params: Record<string, string | number | boolean | undefined | null>): string {
   const sp = new URLSearchParams()
-  for (const [k, v] of Object.entries(params)) {
+  for (
+const [k, v] of Object.entries(params)) {
     if (v != null && v !== '') sp.set(k, String(v))
   }
   return sp.toString()

@@ -1009,7 +1009,8 @@ function fmtThreshold(v: number | undefined): string {
 /** 全窗口里接近度最高的窗口 */
 function dominantWindow(r: AbnormalRow): { key: WindowKey; value: number; threshold: number; closeness: number } | undefined {
   let best: { key: WindowKey; value: number; threshold: number; closeness: number } | undefined
-  for (const w of WINDOW_KEYS) {
+  for (
+const w of WINDOW_KEYS) {
     const info = r.windows[w]
     if (info && (!best || info.closeness > best.closeness)) best = { key: w, ...info }
   }

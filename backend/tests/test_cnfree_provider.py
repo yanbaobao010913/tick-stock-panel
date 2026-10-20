@@ -1277,6 +1277,14 @@ def test_test_dataset_daily_preview_serializes_dates(monkeypatch):
 def test_test_dataset_minute_preview_serializes_datetime(monkeypatch):
     minute = {"sh600519": [_mrow("202609291500", "1", "1", "1", "1", "10")]}
     p = _provider_with(monkeypatch, _FakeClient(minute=minute))
+    # test_dataset 用 datetime.now() 定窗口(now-2d ~ now), 夹具 bar 固定在 09-29:
+    # 不冻表则跑到该日 2 天之后行就被 _minute_rows 区间过滤掉(rows=0)。
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 29, 15, 30)
+
+    monkeypatch.setattr(cp, "datetime", _Frozen)
     out = p.test_dataset("minute", ["600519.SH"])
     assert out["rows"] == 1
     assert out["preview"][0]["datetime"].startswith("2026-09-29T15:00")

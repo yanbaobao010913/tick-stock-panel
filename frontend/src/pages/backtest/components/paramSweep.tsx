@@ -81,7 +81,8 @@ export function useParamSweep(strategies: StrategyDetail[], onStrategyChange?: (
     onStrategyChange?.()
     const s = strategies.find(x => x.id === id)
     const init: Record<string, Sweep> = {}
-    for (const p of s?.params ?? []) init[p.id] = defaultSweep(p)
+    for (
+const p of s?.params ?? []) init[p.id] = defaultSweep(p)
     setSweeps(init)
   }
 
@@ -96,7 +97,8 @@ export function useParamSweep(strategies: StrategyDetail[], onStrategyChange?: (
 
   // 网格合法性 (与后端展开同口径): 步长不整除/越界会被后端拒, 前端提前拦。
   const gridError = useMemo(() => {
-    for (const p of params) {
+    for (
+const p of params) {
       if (!sweeps[p.id]?.enabled) continue
       const err = sweepError(p, sweeps[p.id])
       if (err) return err
@@ -106,7 +108,8 @@ export function useParamSweep(strategies: StrategyDetail[], onStrategyChange?: (
 
   const buildGrid = (): Record<string, any> => {
     const grid: Record<string, any> = {}
-    for (const p of params) {
+    for (
+const p of params) {
       const s = sweeps[p.id]
       if (!s?.enabled) continue
       if (p.type === 'bool') grid[p.id] = [true, false]

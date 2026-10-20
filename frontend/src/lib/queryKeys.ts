@@ -115,6 +115,7 @@ export const QK = {
   paperTrades:          (acc: string) => ['paper', 'trades', acc] as const,
   paperNav:             (acc: string) => ['paper', 'nav', acc] as const,
   paperStats:           (acc: string) => ['paper', 'stats', acc] as const,
+  paperRounds:          (acc: string) => ['paper', 'rounds', acc] as const,
   paperCompare:         ['paper', 'compare'] as const,
   paperAutoRules:       (acc: string) => ['paper', 'auto-rules', acc] as const,
   alerts:               (source?: string) => ['alerts', source ?? ''] as const,
@@ -140,6 +141,7 @@ export const QK = {
   sectorRotationIndexDaily:  (symbol: string) => ['sector-rotation-index-daily', symbol] as const,
   // 扩展表 schema 清单 (板块切换的资金流列选择器等)
   extSchemaAll:         ['ext-schema-all'] as const,
+  extPages:             ['ext-pages'] as const,
 } as const
 
 // ===== SSE 应该 invalidate 的 key 前缀列表 =====

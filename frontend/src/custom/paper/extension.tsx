@@ -2184,7 +2184,8 @@ function AccountPanel({ acc, name, onDeleted }: { acc: string; name?: string; on
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
     }
     const lines = ['日期,代码,方向,数量,成交价,费用,类型,订单号']
-    for (const f of allFills) {
+    for (
+const f of allFills) {
       lines.push([
         f.date, f.symbol,
         f.kind === 'corp_action' ? '除权' : f.side === 'buy' ? '买入' : '卖出',

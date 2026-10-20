@@ -414,7 +414,8 @@ export function QuoteSummaryBar({
 }) {
   const stats = useMemo(() => {
     let upTotal = 0, downTotal = 0, flatTotal = 0
-    for (const g of groups) {
+    for (
+const g of groups) {
       const qm = computeQuoteMetrics(g.stocks, quoteMap)
       upTotal += qm.upCount
       downTotal += qm.downCount

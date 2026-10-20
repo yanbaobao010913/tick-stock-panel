@@ -14,7 +14,8 @@ export function useCustomSignalNames(): Record<string, string> {
   const query = useQuery({ queryKey: QK.customSignals, queryFn: api.customSignalsList })
   return useMemo(() => {
     const names: Record<string, string> = {}
-    for (const s of query.data?.signals ?? []) {
+    for (
+const s of query.data?.signals ?? []) {
       if (s.id && s.name) {
         // 显式 column (迁移自内置的 signal_*) 优先于默认 csg_ 前缀
         names[s.column ?? `csg_${s.id}`] = s.name

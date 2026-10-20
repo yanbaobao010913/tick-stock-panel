@@ -20,7 +20,8 @@ export function mergeSessions<T extends MergeableSession>(
 ): { sessions: T[]; activeId: string } {
   const byId = new Map<string, T>()
   // 先远端后本地 + >= : 引用相同时本地胜出 (用户当前正在看的保持稳定)
-  for (const s of [...remote, ...local]) {
+  for (
+const s of [...remote, ...local]) {
     const existing = byId.get(s.id)
     if (!existing || s.messages.length >= existing.messages.length) byId.set(s.id, s)
   }

@@ -105,7 +105,8 @@ export function packToExtension(pack: unknown): FrontendExtension {
   if (typeof p.id !== 'string' || !p.id.includes('.')) throw new Error('id 必须是带命名空间的字符串 (如 demo.hello)')
   if (!Array.isArray(p.routes) || p.routes.length === 0) throw new Error('routes 不能为空')
   if (!Array.isArray(p.navigation) || p.navigation.length === 0) throw new Error('navigation 不能为空')
-  for (const r of p.routes as PagePackRoute[]) {
+  for (
+const r of p.routes as PagePackRoute[]) {
     if (typeof r?.id !== 'string' || typeof r?.path !== 'string' || !r.path.startsWith('/') || r.path === '/') {
       throw new Error(`路由 ${r?.id} 的 path 必须是非根绝对路径`)
     }
@@ -162,7 +163,8 @@ export async function loadRuntimePageExtensions(opts: LoadRuntimeOptions = {}): 
     return // fail-open: 静默跳过, 不影响启动
   }
   const loaders: Record<string, () => Promise<FrontendExtensionModule>> = {}
-  for (const page of list) {
+  for (
+const page of list) {
     if (!page?.id || page.enabled !== true) continue
     const url = runtimeBundleUrl(page.id)
     loaders[`runtime:${page.id}`] = () => {

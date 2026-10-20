@@ -6,10 +6,15 @@
  * 不随产物分发故不列, 传递依赖由各自包携带许可。
  *
  * 更新方式 (依赖变更后重新生成):
- *   前端: node -e "const fs=require('fs');const d=JSON.parse(fs.readFileSync('package.json','utf8')).dependencies;
- *     for(const n of Object.keys(d)){const p=JSON.parse(fs.readFileSync('node_modules/'+n+'/package.json','utf8'));
+ *   前端: node -e "
+const fs=require('fs');
+const d=JSON.parse(fs.readFileSync('package.json','utf8')).dependencies;
+ *     for(
+const n of Object.keys(d)){
+const p=JSON.parse(fs.readFileSync('node_modules/'+n+'/package.json','utf8'));
  *     console.log(n+'|'+p.version+'|'+p.license)}"
- *   后端: uv run python -c "import tomllib,importlib.metadata as im,json;
+ *   后端: uv run python -c "
+import tomllib,importlib.metadata as im,json;
  *     deps=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies'];
  *     print(json.dumps([{'name':d.split(';')[0].split('[')[0].split('>')[0].split('<')[0].split('=')[0].split('!')[0].strip(),
  *     'version':im.version(d.split(';')[0].split('[')[0].split('>')[0].split('<')[0].split('=')[0].split('!')[0].strip()),

@@ -224,6 +224,10 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
     with paper.PAPER_LOCK:
         # 同一批事件内复用快照, 由 create_order 后的持仓变化反映 (循环内重取)
         for ev in events:
+            # 信息事件防御 (在下单入口, 不只靠文案): 价格路径模式的收复/回落/低位
+            # 反弹事件带 info_only=True, 属观察提示而非交易指令, 此处直接跳过。
+            if ev.get("info_only") or ev.get("type") in {"price_path_recovery", "price_path_bounce"}:
+                continue
             symbol = (ev.get("symbol") or "").strip()
             price = ev.get("price")
             if not symbol or price is None or price <= 0:

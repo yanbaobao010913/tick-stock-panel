@@ -44,8 +44,13 @@ def test_prev_close_reads_across_partitions_with_extra_quote_ts(tmp_path):
 def test_read_daily_bar_reads_across_partitions_with_extra_quote_ts(tmp_path):
     _mixed_partitions(tmp_path)
 
-    assert paper.read_daily_bar(tmp_path, SYM, "stock", "2026-10-08") == pytest.approx({"open": 10.52, "close": 10.62})
-    assert paper.read_daily_bar(tmp_path, SYM, "stock", "2026-09-30") == pytest.approx({"open": 10.61, "close": 10.71})
+    # read_daily_bar 返回完整 OHLC: 条件单靠 high/low 判穿越, 不止 open/close
+    assert paper.read_daily_bar(tmp_path, SYM, "stock", "2026-10-08") == pytest.approx(
+        {"open": 10.52, "high": 10.72, "low": 10.42, "close": 10.62}
+    )
+    assert paper.read_daily_bar(tmp_path, SYM, "stock", "2026-09-30") == pytest.approx(
+        {"open": 10.61, "high": 10.81, "low": 10.51, "close": 10.71}
+    )
 
 
 def test_index_close_reads_across_partitions_with_extra_quote_ts(tmp_path):

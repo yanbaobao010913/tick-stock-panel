@@ -853,11 +853,14 @@ function TagStats({ title, tiers, extFields, fieldKey, color, selectedTag, onSel
     const item = extFields[fieldKey]
     if (!item?.field) return [] as [string, number][]
     const counts = new Map<string, number>()
-    for (const t of tiers) {
-      for (const s of t.stocks) {
+    for (
+const t of tiers) {
+      for (
+const s of t.stocks) {
         if (s.status && s.status !== mainStatus) continue
         const tags = getExtTags(s, item)
-        for (const tag of tags) {
+        for (
+const tag of tags) {
           counts.set(tag, (counts.get(tag) || 0) + 1)
         }
       }
@@ -1019,9 +1022,11 @@ function TierGroup({ tier, defaultOpen, extFields, filterKeys, bf, onStockClick,
   const groupConceptStats = useMemo(() => {
     if (!extFields.showConceptGroupStats || !extFields.concept?.field) return []
     const counts = new Map<string, number>()
-    for (const s of tier.stocks) {
+    for (
+const s of tier.stocks) {
       if (s.status && s.status !== mainStatus) continue
-      for (const tag of getExtTags(s, extFields.concept)) {
+      for (
+const tag of getExtTags(s, extFields.concept)) {
         counts.set(tag, (counts.get(tag) || 0) + 1)
       }
     }
@@ -1031,9 +1036,11 @@ function TierGroup({ tier, defaultOpen, extFields, filterKeys, bf, onStockClick,
   const groupIndustryStats = useMemo(() => {
     if (!extFields.showIndustryGroupStats || !extFields.industry?.field) return []
     const counts = new Map<string, number>()
-    for (const s of tier.stocks) {
+    for (
+const s of tier.stocks) {
       if (s.status && s.status !== mainStatus) continue
-      for (const tag of getExtTags(s, extFields.industry)) {
+      for (
+const tag of getExtTags(s, extFields.industry)) {
         counts.set(tag, (counts.get(tag) || 0) + 1)
       }
     }
@@ -1478,7 +1485,8 @@ export function LimitUpLadder() {
   const ladderRules = useMemo(() => {
     const all = monitorRulesData?.rules ?? []
     const m = new Map<string, typeof all[number]>()
-    for (const r of all) {
+    for (
+const r of all) {
       if (r.type === 'ladder' && r.enabled && r.symbols[0]) {
         m.set(r.symbols[0], r)
       }

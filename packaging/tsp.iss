@@ -25,7 +25,8 @@
 
 ; 版本号: 从 frontend/package.json 读取, 与 Release tag 保持一致
 ; 手动指定更可靠 (CI 传入 /DMyAppVersion)
-#ifndef MyAppVersion
+#ifn
+def MyAppVersion
   #define MyAppVersion     "0.0.0"
 #endif
 
@@ -118,7 +119,8 @@ Filename: "{cmd}"; Parameters: "/C taskkill /F /IM {#MyAppExeName}"; Flags: runh
 // ── 辅助函数: 判断目录是否为空 ─────────────────────────────────
 // Inno Setup 内置无 IsDirEmpty, 用 FindFirst/FindNext 自行实现。
 // 用于卸载后清理空的 {app} 壳目录。
-function IsDirEmpty(const Dir: String): Boolean;
+function IsDirEmpty(
+const Dir: String): Boolean;
 var
   FindRec: TFindRec;
 begin

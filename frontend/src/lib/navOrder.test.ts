@@ -43,7 +43,8 @@ describe('navOrder: 迁移前默认排序基准', () => {
 describe('seedHiddenForNewUser: 新装用户默认隐藏种子', () => {
   it('扩展域页面清单与默认基准一致且共 11 项', () => {
     expect(EXT_DOMAIN_PAGE_PATHS).toHaveLength(11)
-    for (const p of EXT_DOMAIN_PAGE_PATHS) {
+    for (
+const p of EXT_DOMAIN_PAGE_PATHS) {
       expect(defaultNavIndex(p)).not.toBe(Number.POSITIVE_INFINITY)
     }
   })
@@ -51,7 +52,8 @@ describe('seedHiddenForNewUser: 新装用户默认隐藏种子', () => {
   it('新用户 (未完成 onboarding): 11 个扩展页并入隐藏清单', () => {
     const next = seedHiddenForNewUser(false, [])
     expect(next).not.toBeNull()
-    for (const p of EXT_DOMAIN_PAGE_PATHS) expect(next).toContain(p)
+    for (
+const p of EXT_DOMAIN_PAGE_PATHS) expect(next).toContain(p)
   })
 
   it('新用户已有隐藏项: 取并集不丢失', () => {

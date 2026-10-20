@@ -276,6 +276,8 @@ class StrategyDependencyResolver:
             "signal_limit_up",
             "signal_limit_down",
         }
+        # 叠加条件字段并入矩阵列 (供入场掩码按 (时间, 标的) 评估)
+        matrix_columns |= _overlay_numeric_fields(overrides)
         return ResolvedFeaturePlan(
             base_columns=base_columns,
             intermediate_columns=frozenset(),
@@ -727,6 +729,48 @@ class PreparedMatrixBacktest:
     compute_cache: MatrixComputeCache
 
 
+# 叠加条件 → numpy 元素级运算符 (与 custom_signals._OP_BUILDERS 同集;
+# matrix 路径在 float 数组上评估, NaN 一律视为不命中)
+_OVERLAY_NP_OPS = {
+    ">": np.greater, ">=": np.greater_equal,
+    "<": np.less, "<=": np.less_equal,
+    "==": np.equal, "!=": np.not_equal,
+}
+
+
+def _overlay_numeric_fields(overrides: dict) -> set[str]:
+    """叠加条件 (overlay_filter) 引用的数值字段集合, 含 field: 右值引用。
+
+    matrix 路径专用: 矩阵 fields 是 float 数组, 字符串扩展列进不了矩阵 —
+    引用字符串字段时抛 ValueError (保存期校验已拦, 这里是运行期双保险)。
+    """
+    conditions = (overrides or {}).get("overlay_filter")
+    if not isinstance(conditions, list) or not conditions:
+        return set()
+    from app.factors.ext_factors import ext_string_fields
+
+    string_fields = ext_string_fields()
+    fields: set[str] = set()
+    for i, c in enumerate(conditions):
+        if not isinstance(c, dict):
+            raise ValueError(f"第 {i+1} 个叠加条件格式错误")
+        left = str(c.get("left", ""))
+        if left in string_fields:
+            raise ValueError(
+                f"第 {i+1} 个叠加条件: matrix_native 策略不支持字符串字段 {left!r}"
+            )
+        fields.add(left)
+        right = c.get("right")
+        if isinstance(right, str) and right.startswith("field:"):
+            col = right[len("field:"):]
+            if col in string_fields:
+                raise ValueError(
+                    f"第 {i+1} 个叠加条件: matrix_native 策略不支持字符串字段引用 {col!r}"
+                )
+            fields.add(col)
+    return fields
+
+
 class StrategyBacktestService:
     def __init__(
         self,
@@ -931,6 +975,15 @@ class StrategyBacktestService:
                 asset_type=config.asset_type,
             ))
         feature_plan = _merge_resolved_feature_plans(plans)
+        overlay_conditions = StrategyEngine._effective_overlay(overrides)
+        if overlay_conditions and s.execution_backend in ("composite", "minute_filter"):
+            return _err(f"叠加条件不支持 {s.execution_backend} 策略")
+        overlay_fields = _overlay_numeric_fields(overrides)
+        if overlay_fields:
+            feature_plan = replace(
+                feature_plan,
+                matrix_columns=frozenset(set(feature_plan.matrix_columns) | overlay_fields),
+            )
 
         max_hold_days = self._override_value(overrides, "max_hold_days", strategy.max_hold_days)
         full_horizon_days = max(int(max_hold_days or first.holding_days or 5), 1)
@@ -1382,6 +1435,13 @@ class StrategyBacktestService:
                 return _err(str(e))
             if _rm is not None:
                 entry_time_mask = entry_time_mask & _rm
+            overlay_conditions = StrategyEngine._effective_overlay(overrides)
+            if overlay_conditions:
+                overlay_mask, overlay_err = self._overlay_matrix_mask(market_data, overlay_conditions)
+                if overlay_err is not None:
+                    return _err(overlay_err)
+                if overlay_mask is not None:
+                    entry_time_mask = entry_time_mask & overlay_mask
             exit_time_mask = self._matrix_date_range_mask(
                 market_data.timestamp_labels,
                 config.start,
@@ -1486,6 +1546,13 @@ class StrategyBacktestService:
                     return _err(str(e))
                 if _rm is not None:
                     entry_time_mask = entry_time_mask & _rm
+                overlay_conditions = StrategyEngine._effective_overlay(overrides)
+                if overlay_conditions:
+                    overlay_mask, overlay_err = self._overlay_matrix_mask(market_data, overlay_conditions)
+                    if overlay_err is not None:
+                        return _err(overlay_err)
+                    if overlay_mask is not None:
+                        entry_time_mask = entry_time_mask & overlay_mask
                 exit_time_mask = self._matrix_date_range_mask(
                     market_data.timestamp_labels,
                     config.start,
@@ -1604,6 +1671,13 @@ class StrategyBacktestService:
             panel = self._apply_score(panel, s, overrides, universe_mask=candidate_mask, factor_snapshot=factor_snapshot)
             formal_candidate_mask = candidate_mask & formal_range
             entry_mask = self._build_entry_mask_from_candidate(panel, candidate_mask, s, entry_signals)
+            overlay_conditions = StrategyEngine._effective_overlay(overrides)
+            if overlay_conditions:
+                overlay_panel_mask, overlay_err = self._overlay_panel_mask(panel, overlay_conditions)
+                if overlay_err is not None:
+                    return _err(overlay_err)
+                if overlay_panel_mask is not None:
+                    entry_mask = entry_mask & overlay_panel_mask
             entry_mask = entry_mask & formal_range
             if config.regime_filter:
                 date_values = panel.get_column("date").unique().sort().to_list()
@@ -2338,6 +2412,84 @@ class StrategyBacktestService:
 
         # 没有策略候选层时, 由 entry_signals 直接决定买点。
         return true_mask
+
+    @staticmethod
+    def _overlay_panel_mask(
+        panel: pl.DataFrame, conditions: list[dict]
+    ) -> tuple[pl.Series | None, str | None]:
+        """叠加条件 → panel 行布尔掩码 (polars 路径)。出错返回 (None, errmsg)。"""
+        from app.strategy import custom_signals
+
+        try:
+            expr = custom_signals.build_overlay_expr(conditions)
+        except ValueError as e:
+            return None, f"叠加条件编译失败: {e}"
+        if expr is None:
+            return None, None
+        try:
+            enriched = custom_signals.materialize_factor_columns(
+                panel, {"__overlay__": expr}
+            )
+            mask = enriched.select(expr.fill_null(False).alias("__overlay__"))[
+                "__overlay__"
+            ]
+            return mask.cast(pl.Boolean), None
+        except Exception as e:  # noqa: BLE001
+            missing = custom_signals.overlay_missing_columns(conditions, panel.columns)
+            detail = f"，缺失列: {', '.join(missing)}" if missing else f": {e}"
+            return None, f"叠加条件评估失败{detail}"
+
+    @staticmethod
+    def _shift_time(arr: np.ndarray, days: int) -> np.ndarray:
+        """沿时间轴取 N 个交易日前的值 (前 days 行置 NaN, 与 polars shift 同语义)。"""
+        if days <= 0:
+            return arr
+        out = np.full(arr.shape, np.nan, dtype=float)
+        if days < arr.shape[0]:
+            out[days:] = arr[:-days]
+        return out
+
+    @classmethod
+    def _overlay_matrix_mask(
+        cls, market_data: MarketDataMatrix, conditions: list[dict]
+    ) -> tuple[np.ndarray | None, str | None]:
+        """叠加条件 → (T,A) 布尔掩码 (matrix 路径)。出错返回 (None, errmsg)。"""
+        n_times = len(market_data.timestamp_labels)
+        n_assets = len(market_data.symbols)
+        mask = np.ones((n_times, n_assets), dtype=bool)
+        for i, c in enumerate(conditions):
+            op = c.get("op")
+            fn = _OVERLAY_NP_OPS.get(op)
+            if fn is None:
+                return None, f"第 {i+1} 个叠加条件: matrix 路径不支持运算符 {op!r}"
+            left = str(c.get("left", ""))
+            if left not in market_data.fields:
+                return None, (
+                    f"叠加条件引用的列不在回测矩阵中: {left} "
+                    "(请检查扩展数据拉取/因子计算是否可用)"
+                )
+            left_days = int(c.get("leftDays", 0) or 0)
+            right_days = int(c.get("rightDays", 0) or 0)
+            left_arr = cls._shift_time(
+                np.asarray(market_data.fields[left], dtype=float), left_days
+            )
+            right = c.get("right")
+            if isinstance(right, str) and right.startswith("field:"):
+                col = right[len("field:"):]
+                if col not in market_data.fields:
+                    return None, f"叠加条件引用的列不在回测矩阵中: {col}"
+                right_arr = cls._shift_time(
+                    np.asarray(market_data.fields[col], dtype=float), right_days
+                )
+                cond = fn(left_arr, right_arr) & ~np.isnan(left_arr) & ~np.isnan(right_arr)
+            else:
+                try:
+                    value = float(right)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    return None, f"第 {i+1} 个叠加条件: 右值必须是数字 (matrix 路径)"
+                cond = fn(left_arr, value) & ~np.isnan(left_arr)
+            mask &= cond
+        return mask, None
 
     def _build_entry_mask_from_candidate(
         self,

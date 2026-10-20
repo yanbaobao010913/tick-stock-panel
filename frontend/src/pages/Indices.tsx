@@ -119,7 +119,8 @@ export function Indices() {
 
   const quoteBySymbol = useMemo(() => {
     const m = new Map<string, any>()
-    for (const q of quotes.data?.rows ?? []) m.set(q.symbol, q)
+    for (
+const q of quotes.data?.rows ?? []) m.set(q.symbol, q)
     return m
   }, [quotes.data?.rows])
   const selectedQuote = selectedSymbol ? quoteBySymbol.get(selectedSymbol) : null

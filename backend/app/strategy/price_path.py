@@ -194,7 +194,7 @@ def merge_round_events(events: list[dict]) -> list[dict]:
         sym = ev.get("symbol")
         if not kind or not sym or not ev.get("rule_id"):
             continue
-        key = (str(sym), _base_kind(str(kind)), str(ev.get("type")))
+        key = (str(sym), _base_kind(str(kind)), _base_kind(str(ev.get("type"))))
         group = groups.get(key)
         if group is None:
             groups[key] = {"winner": ev, "count": 1}
@@ -211,7 +211,7 @@ def merge_round_events(events: list[dict]) -> list[dict]:
         if not kind or not sym or not ev.get("rule_id"):
             out.append(ev)
             continue
-        group = groups[(str(sym), _base_kind(str(kind)), str(ev.get("type")))]
+        group = groups[(str(sym), _base_kind(str(kind)), _base_kind(str(ev.get("type"))))]
         if ev is group["winner"]:
             ev["merged_count"] = group["count"]
             out.append(ev)

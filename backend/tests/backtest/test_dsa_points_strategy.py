@@ -130,7 +130,7 @@ def test_builtin_strategy_registered():
     assert engine.has("dsa_points")
     listed = {s["id"]: s for s in engine.list_strategies()}
     assert listed["dsa_points"]["name"] == "DSA 点位"
-    assert listed["dsa_points"]["source"] == "builtin"
+    assert listed["dsa_points"]["source"] == "custom"  # 上游 v0.3.7 起内置策略种入 custom
     # 选股器空跑安全: compute_signals 返回合法空信号
     market = build_market_data_matrix(_panel({SYM_A: [(10.0, 10.2, 9.8, 10.0)]}))
     signals = engine.get("dsa_points").matrix_strategy.compute_signals(market, {})

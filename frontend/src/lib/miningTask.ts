@@ -234,7 +234,8 @@ function connect(runId: string) {
       typeof payload.message === 'string' ? payload.message : undefined,
     )
   }
-  for (const type of [
+  for (
+const type of [
     'succeeded',
     'succeeded_with_budget_exhausted',
     'failed',
