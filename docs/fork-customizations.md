@@ -40,6 +40,17 @@ cd ../frontend && pnpm build
 | 纸质交易条件单(依赖日线 high/low) | `backend/app/strategy/paper.py` `read_daily_bar` 返回完整 OHLC | `test_paper_conditional.py` `test_paper_bar_read_schema.py` |
 | DSA 桥接(分析/回测/组合/自选/提醒) | `backend/app/custom/dsa_bridge.py` 等 | `test_dsa_*.py` |
 
+### 已提交上游的通用修复 (2026-10-20)
+
+以下修复与 DSA/cnfree 无关, 已作为独立 PR 提交上游。上游合并后, 同步时直接采用上游实现并删除本文件的对应条目:
+
+| 修复 | 上游 PR |
+| --- | --- |
+| 标的维表 fail-closed(部分交易所失败不覆盖旧表) | #495 |
+| 自定义分钟源按块流式落盘 | #496 |
+| 桌面启动失败页 + 挖掘锁预检 | #497 |
+| 盘后分钟门控与 `api/kline` 对齐 | #498 |
+
 ## 3. 前端页面注册(v0.3.9 起已迁移到扩展)
 
 v0.3.6 起上游采用「核心 + 扩展」架构:页面、路由、侧栏导航统一由 `frontend/src/custom/<ns>/extension.tsx` 单文件声明,构建时自动发现。fork 曾另有 11 份 `frontend/src/pages/<X>.tsx` 副本并手工注册进 `router.tsx`,导致双重注册、重复导航和扩展被 `CORE_ROUTE_PATHS` 拒绝;这些副本已在 v0.3.9 同步中删除。
