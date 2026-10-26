@@ -4,7 +4,7 @@
 
 ## 当前结论
 
-已在独立适配分支 `sync/upstream-v0.3.18-codex` 将上游 v0.3.18 与定制版整合,19 处冲突全部解决,没有整文件取上游覆盖定制。已于 2026-10-27 以 merge commit `14677bb3` 提交到该分支(同步改动与两处缺陷修复同一提交),并推送到 fork 的 `sync/upstream-v0.3.18-codex`,尚未部署。用户追问前端失败项后确认:继承问题中包含真实配置保存与草稿发布缺陷,不能仅按旧测试忽略;处理前不建议上线,修复结果见文末「两个组件的修复结果」。
+已在独立适配分支 `sync/upstream-v0.3.18-codex` 将上游 v0.3.18 与定制版整合,19 处冲突全部解决,没有整文件取上游覆盖定制。已于 2026-10-27 以 merge commit `14677bb3` 提交到该分支(同步改动与两处缺陷修复同一提交),并推送到 fork 的 `sync/upstream-v0.3.18-codex`。用户追问前端失败项后确认:继承问题中包含真实配置保存与草稿发布缺陷,不能仅按旧测试忽略;处理前不建议上线,修复结果见文末「两个组件的修复结果」。2026-10-27 已回补线上冷却热修并完成云端换版,见文末「上云部署记录」。
 
 上一轮停在差异调查。用户随后明确要求“更新一下我们的”“注意我们自己的修改”,本轮据现有定制台账完成源码适配与验证。
 
@@ -137,3 +137,15 @@ frontend/src/pages/settings/System.tsx
 - 测试按定制版真实行为改写:删除分区导航相关断言,新增 PATCH 保留既有风控/叠加、完整风控字段保存、叠加条件 offset 保存、草稿发布过滤等回归;后端新增 `test_strategy_saved_params.py::test_dialog_patch_preserves_existing_risk_overlay_and_unedited_fields`(合并保留、显式清空、非法条件 400 且不落盘)。
 
 验证:两个弹窗测试 15 passed(整个 screener 目录 29 passed);前端全量 Vitest 41 文件、322 测试通过,仅剩 `DimensionMembersDialog.test.ts`、`neighborPrefetch.test.ts` 两个 `node:test` 文件被 Vitest 误收(与本次改动无关,按 `node --test` 执行通过);`tsc -b` 无错误;后端全量 3803 passed、16 skipped、1 xfailed,唯一失败 `test_spawn_walkforward_skips_folds_before_available_matrix_data` 单独重跑通过(全量并发下的进程启动抖动)。
+
+### 上云部署记录（2026-10-27）
+
+线上原有 p0 热修（2026-10-23，enriched 换代后 120s 冷却）只存在于服务器 bundle，未进入任何 git 分支；上游 v0.3.18 也未包含。直接换版会丢掉该 2.5G cgroup OOM 防护，故先回补再部署。
+
+- 热修移植：`backend/app/tickflow/repository.py`（`_ENRICHED_REFRESH_COOLDOWN_SECONDS=120`、冷却守卫、warmup 冷却早退、`clear_cache` 重置），新增 `backend/tests/test_enriched_refresh_cooldown.py` 7 项回归，既有 warming guard 测试补冷却属性。提交 `07bae6f0`。
+- 验证：后端全量 3811 passed、16 skipped、1 xfailed；新增测试 7 passed。
+- 合并：PR #2 → `fork/main` merge commit `fa7e11e8`。合并后 GitHub Actions 未触发新 run（仓库/工作流状态正常，原因未定位），改用服务器本地构建。
+- 构建：以 `fork/main` 源码 bundle 在服务器 `docker build`（基础镜像经 daocloud 镜像拉取后打回官方 tag），产物 `tsp:v0.3.18-20261026`（`sha256:f076628fea…`，1.92G）。
+- 换版：保留原 ports/env/mounts/memory(2.5G+3G swap)/restart 策略，旧容器改名保留为 `tsp_rollback_20261026T174200Z`。健康检查 200，`/health` 返回 `version=0.3.18`，RestartCount=0，日志无 traceback，`/` 返回前端页面；`market-snapshot`/`sector-rotation` 未认证返回 401（鉴权生效），带登录态的接口验收因无面板密码未执行。
+- 备份：`/opt/tsp/deploy-backup/upgrade-v0.3.18-20261026T171442Z/data.tar.gz`（543M，含 data/.env/tiers.yaml）；换版快照 `/opt/tsp/deploy-backup/swap-20261026T174200Z/`。
+- 未验证：真实交易时段行情行为、桌面端打包、认证后的重接口验收。
