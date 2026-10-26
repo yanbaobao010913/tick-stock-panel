@@ -97,7 +97,7 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
 
   // research_only 草稿(AI 来源)单独列出, 供「发布」操作; 不进待选列表
   const drafts = useMemo(
-    () => allStrategies.filter(s => s.research_only),
+    () => allStrategies.filter(s => s.source === 'ai' && s.research_only),
     [allStrategies]
   )
 

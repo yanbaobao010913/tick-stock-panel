@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import polars as pl
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from app.api import strategy as strategy_api
 from app.strategy import config as strategy_config
@@ -84,6 +85,59 @@ def test_patch_config_preserves_other_user_overrides(tmp_path):
     assert saved["stop_loss"] == -0.05
     assert saved["scoring"] == {"rsi_14": 1.0}
     assert saved["scoring_directions"] == {"rsi_14": "low"}
+
+
+def test_dialog_patch_preserves_existing_risk_overlay_and_unedited_fields(tmp_path):
+    engine, _ = _make_engine()
+    app = FastAPI()
+    app.include_router(strategy_api.router)
+    app.state.strategy_engine = engine
+    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
+    client = TestClient(app)
+    previous = {
+        "name": "原名称",
+        "stop_loss": -0.05,
+        "take_profit": 0.15,
+        "trailing_stop": -0.08,
+        "trailing_take_profit_activate": 0.2,
+        "trailing_take_profit_drawdown": 0.05,
+        "overlay_filter": [
+            {"left": "close", "op": ">", "right": "10", "leftDays": 1, "rightDays": 0}
+        ],
+        "order_by": "turnover_rate",
+    }
+    strategy_config.save_override(tmp_path, "saved_params", previous)
+
+    response = client.patch("/api/strategies/config", json={
+        "strategy_id": "saved_params", "overrides": {"name": "新名称"},
+    })
+
+    assert response.status_code == 200
+    assert strategy_config.load_override(tmp_path, "saved_params") == {
+        **previous, "name": "新名称",
+    }
+    detail = client.get("/api/strategies/saved_params")
+    assert detail.status_code == 200
+    assert detail.json()["overlay_filter"] == previous["overlay_filter"]
+    assert detail.json()["take_profit"] == 0.15
+
+    response = client.patch("/api/strategies/config", json={
+        "strategy_id": "saved_params",
+        "overrides": {"overlay_filter": [], "take_profit": None},
+    })
+    assert response.status_code == 200
+    saved = strategy_config.load_override(tmp_path, "saved_params")
+    assert saved["overlay_filter"] == []
+    assert saved["take_profit"] is None
+    assert saved["trailing_stop"] == previous["trailing_stop"]
+    assert saved["order_by"] == previous["order_by"]
+
+    response = client.patch("/api/strategies/config", json={
+        "strategy_id": "saved_params",
+        "overrides": {"name": "错误保存", "overlay_filter": [{"left": "no_such_column"}]},
+    })
+    assert response.status_code == 400
+    assert strategy_config.load_override(tmp_path, "saved_params") == saved
 
 
 def test_strategy_detail_echoes_saved_risk_overrides():

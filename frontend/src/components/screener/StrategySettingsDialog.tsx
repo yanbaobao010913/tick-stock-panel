@@ -1,12 +1,15 @@
 ﻿import { useState, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { useQuery } from '@tanstack/react-query'
 import { X, Settings2, RotateCcw, Save, ChevronDown, Filter, Star, TrendingUp, Sparkles, Download, Layers, Plus, Trash2 } from 'lucide-react'
-import { api, type StrategyDetail, type StrategyParamDef, type CompositeChildInfo, type ScoringDirection } from '@/lib/api'
+import { api, type StrategyDetail, type StrategyParamDef, type CompositeChildInfo, type ScoringDirection, type CustomSignalCondition } from '@/lib/api'
+import { QK } from '@/lib/queryKeys'
 import { toPercentages, normalizeWeights } from '@/lib/weights'
 import { BUILTIN_COLUMNS } from '@/lib/watchlist-columns'
 import { color } from '@/lib/colors'
 import { SignalPicker } from './SignalPicker'
 import { SignalTriggerActions } from '@/components/signals/SignalTriggerActions'
+import { ConditionEditor } from '@/components/signals/ConditionEditor'
 import { Modal } from '@/components/Modal'
 import { ScoringEditor } from '@/components/ScoringEditor'
 
@@ -32,6 +35,10 @@ interface Props {
   onSaved?: (displayLimit: number | null) => void
   onAiModify?: () => void
   onDeleted?: () => void
+}
+
+function overlaySupported(detail: StrategyDetail | null): boolean {
+  return !!detail && !['composite', 'minute_filter'].includes(detail.execution_backend)
 }
 
 // ===== 可折叠区域 =====
@@ -189,6 +196,31 @@ function ParamField({ def, value, onChange }: {
   )
 }
 
+// 显示百分比 (5 = 5%)，保存小数 (0.05)；历史负值按绝对值显示。
+function RiskPctField({ label, value, onChange, min, max, unit = '%' }: {
+  label: string
+  value: number | null
+  onChange: (value: number | null) => void
+  min: number
+  max: number
+  unit?: string
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="w-[88px] shrink-0 text-[11px] text-secondary">{label}</span>
+      <input
+        aria-label={label}
+        type="number"
+        value={value == null ? '' : Math.round(Math.abs(value) * 10000) / 100}
+        onChange={e => onChange(e.target.value === '' ? null : Math.abs(Number(e.target.value)) / 100)}
+        min={min} max={max} step={0.5} placeholder="未启用"
+        className="w-16 h-6 px-1.5 rounded bg-base border border-border text-[11px] font-mono text-foreground text-center focus:outline-none focus:border-accent/50"
+      />
+      <span className="text-[10px] text-muted">{unit}</span>
+    </div>
+  )
+}
+
 export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModify, onDeleted }: Props) {
   const [detail, setDetail] = useState<StrategyDetail | null>(null)
   const [loading, setLoading] = useState(false)
@@ -204,6 +236,11 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
   const [scoringDirections, setScoringDirections] = useState<Record<string, ScoringDirection>>({})
   const [stopLoss, setStopLoss] = useState<number | null>(null)
   const [maxHoldDays, setMaxHoldDays] = useState<number | null>(null)
+  const [takeProfit, setTakeProfit] = useState<number | null>(null)
+  const [trailingStop, setTrailingStop] = useState<number | null>(null)
+  const [ttpActivate, setTtpActivate] = useState<number | null>(null)
+  const [ttpDrawdown, setTtpDrawdown] = useState<number | null>(null)
+  const [overlayFilter, setOverlayFilter] = useState<CustomSignalCondition[]>([])
   const [entrySignals, setEntrySignals] = useState<string[]>([])
   const [exitSignals, setExitSignals] = useState<string[]>([])
   const [displayLimit, setDisplayLimit] = useState<number | null>(null)
@@ -218,51 +255,96 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
   const [deleting, setDeleting] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleteError, setDeleteError] = useState('')
+  const [saveError, setSaveError] = useState('')
+  const [baseline, setBaseline] = useState('')
+
+  const overlayOptions = useQuery({
+    queryKey: QK.customSignalsOptions,
+    queryFn: api.customSignalsOptions,
+    enabled: overlaySupported(detail),
+  })
+  const numericOnly = detail?.execution_backend === 'matrix_native'
+  const stringFields = overlayOptions.data?.stringFields ?? []
+  const overlayFields = (overlayOptions.data?.fields ?? [])
+    .filter(field => !numericOnly || !stringFields.includes(field.key))
+  const overlayGroups = overlayOptions.data?.groups
+    ?.map(group => ({ ...group, fields: group.fields.filter(field => !numericOnly || !stringFields.includes(field.key)) }))
+    .filter(group => group.fields.length > 0)
+
+  const currentSnapshot = JSON.stringify({
+    name: strategyName, desc: strategyDesc, bf: basicFilter, params, scoring, dirs: scoringDirections,
+    sl: stopLoss, mh: maxHoldDays, tp: takeProfit, ts: trailingStop, ta: ttpActivate, td: ttpDrawdown,
+    en: entrySignals, ex: exitSignals, limit: displayLimit, enabled: basicFilterEnabled, overlay: overlayFilter,
+    children: compositeChildren.map(c => ({ id: c.id, weight: c.weight })),
+  })
+  const dirty = !!detail && !loading && currentSnapshot !== baseline
 
   // 辅助：更新 basicFilter 某个 key
   const setBF = useCallback((key: string, value: any) => {
     setBasicFilter(prev => ({ ...prev, [key]: value }))
   }, [])
 
-  // 加载策略详情
+  // 初次加载和重置共用同一入口，风控、叠加条件、子策略百分比一起恢复。
+  const loadIntoState = useCallback((d: StrategyDetail) => {
+    const bf = { ...d.basic_filter, boards: d.basic_filter?.boards ?? ALL_BOARDS }
+    const overlay = (d.overlay_filter ?? []).map(c => ({ leftDays: 0, rightDays: 0, ...c }))
+    const list = d.composite_children ?? []
+    const percentages = toPercentages(list.map(c => c.weight))
+    const children = list.map((c, i) => ({ ...c, weight: percentages[i] }))
+    setDetail(d)
+    setStrategyName(d.name ?? '')
+    setStrategyDesc(d.description ?? '')
+    setBasicFilter(bf)
+    setParams(d.params_defaults)
+    setScoring(d.scoring)
+    setScoringDirections(d.scoring_directions ?? {})
+    setStopLoss(d.stop_loss ?? null)
+    setMaxHoldDays(d.max_hold_days ?? null)
+    setTakeProfit(d.take_profit ?? null)
+    setTrailingStop(d.trailing_stop ?? null)
+    setTtpActivate(d.trailing_take_profit_activate ?? null)
+    setTtpDrawdown(d.trailing_take_profit_drawdown ?? null)
+    setOverlayFilter(overlay)
+    setEntrySignals(d.entry_signals ?? [])
+    setExitSignals(d.exit_signals ?? [])
+    setDisplayLimit(d.display_limit ?? null)
+    setBasicFilterEnabled(d.basic_filter?.enabled !== false)
+    setCompositeChildren(children)
+    setSaveError('')
+    setBaseline(JSON.stringify({
+      name: d.name ?? '', desc: d.description ?? '', bf, params: d.params_defaults,
+      scoring: d.scoring, dirs: d.scoring_directions ?? {}, sl: d.stop_loss ?? null,
+      mh: d.max_hold_days ?? null, tp: d.take_profit ?? null, ts: d.trailing_stop ?? null,
+      ta: d.trailing_take_profit_activate ?? null, td: d.trailing_take_profit_drawdown ?? null,
+      en: d.entry_signals ?? [], ex: d.exit_signals ?? [], limit: d.display_limit ?? null,
+      enabled: d.basic_filter?.enabled !== false, overlay,
+      children: children.map(c => ({ id: c.id, weight: c.weight })),
+    }))
+  }, [])
+
   useEffect(() => {
     if (!strategyId) return
+    let cancelled = false
+    setDetail(null)
     setEditingChildId(null)
+    setShowAddChild(false)
+    setShowDeleteConfirm(false)
+    setSaveError('')
     setLoading(true)
     api.strategyGet(strategyId)
       .then(d => {
-        setDetail(d)
-        setStrategyName(d.name ?? '')
-        setStrategyDesc(d.description ?? '')
-        // 确保 boards 有默认值
-        const bf = { ...d.basic_filter }
-        if (!bf.boards) bf.boards = ALL_BOARDS
-        setBasicFilter(bf)
-        setParams(d.params_defaults)
-        setScoring(d.scoring)
-        setScoringDirections(d.scoring_directions ?? {})
-        setStopLoss(d.stop_loss)
-        setMaxHoldDays(d.max_hold_days)
-        setEntrySignals(d.entry_signals ?? [])
-        setExitSignals(d.exit_signals ?? [])
-        setDisplayLimit(d.display_limit ?? null)
-        setBasicFilterEnabled(d.basic_filter?.enabled !== false)
-        setCompositeChildren((() => {
-          // 存储的小数权重 → 滑块百分比口径
-          const list = d.composite_children ?? []
-          const pcts = toPercentages(list.map(c => c.weight))
-          return list.map((c, i) => ({ ...c, weight: pcts[i] }))
-        })())
-        // composite 策略: 加载全部可选子策略(排除自身和其他 composite)供添加
+        if (cancelled) return
+        loadIntoState(d)
         if (d.source === 'composite') {
           api.screenerStrategies().then(data => {
-            setAllStrategies((data.presets ?? []).filter(s => s.id !== strategyId && s.source !== 'composite'))
-          }).catch(() => setAllStrategies([]))
+            if (!cancelled) setAllStrategies((data.presets ?? []).filter(s => s.id !== strategyId && s.source !== 'composite'))
+          }).catch(() => { if (!cancelled) setAllStrategies([]) })
         }
       })
-      .catch(() => setDetail(null))
-      .finally(() => setLoading(false))
-  }, [strategyId])
+      .catch(() => { if (!cancelled) setDetail(null) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [strategyId, loadIntoState])
 
   // 叠加策略: 滑块百分比口径, 允许总和 ≠100, 保存时自动按比例归一
   const compositeTotal = compositeChildren.reduce((s, c) => s + (c.weight || 0), 0)
@@ -280,7 +362,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
     if (!strategyId) return
     setSaving(true)
     try {
-      await api.strategySaveConfig(strategyId, {
+      await api.strategyPatchConfig(strategyId, {
         name: strategyName,
         description: strategyDesc,
         basic_filter: { ...basicFilter, enabled: basicFilterEnabled },
@@ -291,10 +373,15 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
           scoring_replace: true,
         } : {}),
         stop_loss: stopLoss,
+        take_profit: takeProfit,
+        trailing_stop: trailingStop,
+        trailing_take_profit_activate: ttpActivate,
+        trailing_take_profit_drawdown: ttpDrawdown,
         max_hold_days: maxHoldDays,
         entry_signals: entrySignals,
         exit_signals: exitSignals,
         display_limit: displayLimit,
+        ...(overlaySupported(detail) ? { overlay_filter: overlayFilter } : {}),
         // 叠加策略: 子策略权重(composite 专属, 走 override.children 持久化)
         ...(detail?.source === 'composite'
           ? { children: (() => {
@@ -317,24 +404,9 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
     setResetting(true)
     try {
       await api.strategyResetConfig(strategyId)
-      // 重新加载默认值
-      const d = await api.strategyGet(strategyId)
-      setDetail(d)
-      setStrategyName(d.name ?? '')
-      setStrategyDesc(d.description ?? '')
-      const bf = { ...d.basic_filter }
-      if (!bf.boards) bf.boards = ALL_BOARDS
-      setBasicFilter(bf)
-      setParams(d.params_defaults)
-      setScoring(d.scoring)
-      setScoringDirections(d.scoring_directions ?? {})
-      setStopLoss(d.stop_loss)
-      setMaxHoldDays(d.max_hold_days)
-      setEntrySignals(d.entry_signals ?? [])
-      setExitSignals(d.exit_signals ?? [])
-      setDisplayLimit(d.display_limit ?? null)
-      setBasicFilterEnabled(d.basic_filter?.enabled !== false)
-      setCompositeChildren(d.composite_children ?? [])
+      loadIntoState(await api.strategyGet(strategyId))
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : '重置失败，请重试')
     } finally {
       setResetting(false)
     }
@@ -531,6 +603,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                 : (
                 <div className="grid grid-cols-3 gap-5 items-start">
                   {/* 列1：选股条件 */}
+                  <div className="space-y-3">
                     <Section icon={Filter} title="基础参数" accent="text-sky-400">
                       <div className="flex items-center justify-between mb-1">
                         <span className="text-[10px] text-muted">启用基础参数过滤</span>
@@ -567,6 +640,20 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                     </div>
                   </Section>
 
+                    <Section icon={Filter} title="叠加条件" accent="text-sky-400">
+                      {overlaySupported(detail) ? (
+                        <>
+                          <ConditionEditor conditions={overlayFilter} onChange={setOverlayFilter}
+                            options={{ fields: overlayFields, groups: overlayGroups, stringFields: numericOnly ? [] : stringFields }}
+                            title="叠加过滤（多条件为「且」关系）" allowEmpty />
+                          <div className="text-[10px] leading-4 text-muted">
+                            策略 / 回测 / 监控一致生效；点「最新」可改为「前N日」，按交易日回看，最多 60 日。
+                          </div>
+                        </>
+                      ) : <div className="text-[11px] text-muted">分钟策略不支持叠加条件</div>}
+                    </Section>
+                  </div>
+
                   {/* 列2：策略参数 */}
                   <div className="space-y-3">
                     {detail.params.length > 0 ? (
@@ -597,15 +684,20 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
 
                     <Section icon={TrendingUp} title="交易参数" accent="text-emerald-400">
                       <div className="space-y-2">
+                        <RiskPctField label="止损" value={stopLoss} onChange={value => setStopLoss(value == null ? null : -value)} min={0} max={99} />
+                        <RiskPctField label="止盈" value={takeProfit} onChange={setTakeProfit} min={1} max={500} />
+                        <RiskPctField label="移动止损" value={trailingStop} onChange={setTrailingStop} min={0.5} max={50} />
+                        <RiskPctField label="回撤止盈启动" value={ttpActivate} min={1} max={200}
+                          onChange={value => {
+                            setTtpActivate(value)
+                            if (value != null && ttpDrawdown != null && ttpDrawdown > value) setTtpDrawdown(value)
+                          }} />
+                        <RiskPctField label="回撤止盈回撤" value={ttpDrawdown} min={0.5} max={50} unit="点"
+                          onChange={value => setTtpDrawdown(value != null && ttpActivate != null ? Math.min(value, ttpActivate) : value)} />
                         <div className="flex items-center gap-1.5">
-                          <span className="text-[11px] text-secondary w-12 shrink-0">止损</span>
-                          <input type="number" value={stopLoss ?? ''} onChange={e => setStopLoss(e.target.value === '' ? null : Number(e.target.value))} step={0.01} min={-0.5} max={0}
-                            className="w-16 h-6 px-1.5 rounded bg-base border border-border text-[11px] font-mono text-foreground text-center focus:outline-none focus:border-accent/50" />
-                          <span className="text-[10px] text-muted">{stopLoss != null ? `${(stopLoss * 100).toFixed(1)}%` : '—'}</span>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-[11px] text-secondary w-12 shrink-0">持有</span>
-                          <input type="number" value={maxHoldDays ?? ''} onChange={e => setMaxHoldDays(e.target.value === '' ? null : Number(e.target.value))} step={1} min={1}
+                          <span className="w-[88px] shrink-0 text-[11px] text-secondary">最长持仓</span>
+                          <input aria-label="最长持仓" type="number" value={maxHoldDays ?? ''}
+                            onChange={e => setMaxHoldDays(e.target.value === '' ? null : Number(e.target.value))} step={1} min={1}
                             className="w-16 h-6 px-1.5 rounded bg-base border border-border text-[11px] font-mono text-foreground text-center focus:outline-none focus:border-accent/50" />
                           <span className="text-[10px] text-muted">天</span>
                         </div>
@@ -662,8 +754,12 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                 <button onClick={() => { setDeleteError(''); setShowDeleteConfirm(true) }}
                   className="text-[10px] text-danger hover:text-danger/80 transition-colors">删除策略</button>
               )}
+              {saveError && <span className="text-[10px] text-danger">{saveError}</span>}
             </div>
             <div className="flex items-center gap-2">
+              {dirty && (
+                <span className="text-[10px] text-amber-400" role="status">有未保存的改动</span>
+              )}
               {onAiModify && (detail?.source === 'ai' || detail?.source === 'custom') && (
                 <button onClick={onAiModify}
                   className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-amber-400/30 bg-amber-400/8 text-amber-400 text-xs font-medium hover:bg-amber-400/15 transition-colors cursor-pointer">

@@ -55,7 +55,7 @@ def _failed_html(reason: str | None = None) -> str:
 </style></head><body><div class="box">
   <h1>{title}</h1>
   {body}
-  <p>反复失败时查看日志：data\\desktop.log</p>
+  <p>反复失败时查看日志：data\\logs\\desktop.log</p>
 </div></body></html>"""
 
 
@@ -79,13 +79,12 @@ def _ensure_data_dir_writable() -> None:
 
 
 def _precheck_mining_lock() -> str | None:
-    """启动前预检挖掘锁。返回 None = 可启动; 返回 str = 冲突原因 (给失败页)。
+    """启动前预检挖掘锁。返回 None = 无冲突; 返回 str = 冲突原因 (仅日志)。
 
-    app.main 的 lifespan 第一件事就是抢 data_dir/.mining_process_lock,
-    被别的后端实例 (panel 模式、隧道后端或残留进程) 占住时 lifespan 直接
-    抛 MiningProcessLockError, uvicorn 吞掉后主线程只能等满超时报笼统的
-    "启动失败"。这里用同一把锁试抢一下, 提前把冲突翻译成用户可操作的指引。
-    试抢成功立即释放, 真正的持有仍由 lifespan 负责。
+    app.main 的 lifespan 会抢 data_dir/.mining_process_lock; 被别的后端
+    实例 (panel 模式、隧道后端或残留进程) 占住时, 现在 lifespan 只降级
+    (挖掘入口 409, 面板可用, 挖掘页提供强制释放), 这里提前留一条日志
+    方便排查。试抢成功立即释放, 真正的持有仍由 lifespan 负责。
     """
     from app.config import settings
     from app.services.mining_process_lock import (
@@ -178,34 +177,17 @@ def _guard_streams() -> None:
 
 
 def _setup_logging() -> None:
-    """配置日志落盘到 data/desktop.log。
+    """配置日志落盘到 data/logs/desktop.log (10MB×5 切割)。
 
     背景: spec 里 console=False (桌面应用不弹黑窗), 导致 logging 默认输出的
     stderr 被吞掉 —— 启动期任何异常用户都看不到, 表现为「双击一闪退出、查无日志」。
-    这里追加一个 FileHandler, 让日志同时落到 data_dir/desktop.log, 事后可查。
-
-    时序注意: data_dir 在 import app.config 时路径已可用, 但目录此刻可能不存在
-    (frozen 首次运行), 必须先 mkdir, 否则 FileHandler 打开文件会抛 FileNotFoundError。
-    不用第二次 basicConfig (它「首次调用才生效」), 改用 addHandler 追加。
+    这里经共享的 attach_rotating_log 追加轮转文件 handler, 事后可查; 桌面版
+    长期挂机, 不切割的追加日志会无限增长 (用户反馈的磁盘隐患)。
+    旧版的 data/desktop.log 由 attach_rotating_log 一次性迁入 data/logs/。
     """
-    try:
-        from app.config import settings
+    from app.logfile import attach_rotating_log
 
-        log_dir = settings.data_dir
-        log_dir.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(
-            log_dir / "desktop.log",
-            mode="a",            # 追加, 保留历史 (排查时往往需要对比多次启动)
-            encoding="utf-8",
-            errors="replace",    # 容错: 对齐 __init__.py 的 stderr 重配, 避免中文/emoji 触发 UnicodeEncodeError
-        )
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
-        logging.getLogger().addHandler(handler)
-    except Exception as e:  # noqa: BLE001
-        # 日志落盘失败不阻断启动 (开发模式 data_dir 可能不可写)
-        logger.warning("日志文件初始化失败, 仅输出到 stderr: %s", e)
+    attach_rotating_log("desktop.log", max_mb=10, backup_count=5)
 
 
 def _show_crash(title: str, text: str) -> None:
@@ -300,6 +282,11 @@ def _run_uvmicorn(port: int, ready_event: threading.Event) -> None:
         log_level="info",
         access_log=False,    # 桌面版不需要访问日志
         loop="auto",
+        # log_config=None: uvicorn 默认给 uvicorn.* 挂独立 console handler 且
+        # propagate=False, windowed 模式下 stderr 已被守护替换, lifespan 启动
+        # 失败的 "Application startup failed" 永远到不了 desktop.log (失败页
+        # 承诺的排查入口)。置 None 让 uvicorn 日志走 root 的 FileHandler 落盘。
+        log_config=None,
     )
     server = uvicorn.Server(config)
 
@@ -411,14 +398,12 @@ def main() -> int:
     if not _acquire_single_instance():
         return 0
 
-    # 挖掘锁预检: 被其他后端实例占住时 lifespan 必败, 提前秒显失败页并给出
-    # 操作指引, 而不是让用户对着超时后的笼统"启动失败"猜 (见 _precheck_mining_lock)
+    # 挖掘锁预检: 撞锁只降级不再拦截启动 — lifespan 会以降级模式起面板
+    # (挖掘入口 409), 用户可在挖掘页查看持有者并强制释放陈旧持有者;
+    # 这里只提前留一条日志方便排查。
     conflict = _precheck_mining_lock()
     if conflict is not None:
-        logger.error("启动预检: %s", conflict.replace("\n", " "))
-        _open_static_window(_failed_html(conflict))
-        _release_single_instance()
-        return 1
+        logger.warning("启动预检: %s", conflict.replace("\n", " "))
 
     try:
         port = _find_free_port(_BASE_PORT)
@@ -436,7 +421,7 @@ def main() -> int:
         # ready 由后端线程 finally 置位 → 线程已退出时立刻返回, 不等满超时
         if not _wait_for_server(port, timeout=60.0, done_event=ready):
             reason = (
-                "后端进程已提前退出，详情见 data\\desktop.log"
+                "后端进程已提前退出，详情见 data\\logs\\desktop.log"
                 if ready.is_set() else None
             )
             logger.error("后端未就绪 (reason=%s), 桌面版退出", reason)

@@ -29,19 +29,21 @@ provider_has_dataset 为 False 自动回退 TickFlow。
 
 除权因子推导(实测腾讯 qfq 为"减法+乘法"混合仿射口径, 2026-09-30 复核):
   段内 qfq 满足仿射关系 qfq = a·raw + b(a/b 段内恒定: 纯分红段 a=1、b=-ΣD;
-  送转之后的段 a≠1, 实测残差 ≤0.001)。事件边界取自腾讯日K行自带的除权
-  注释(dict, 含 cqr, 实测分红与送转除权日均标注); 对每一边界用相邻两段的
+  送转之后的段 a≠1, 实测残差 ≤0.001)。事件边界优先取腾讯日K行自带的除权注释
+  (dict, 含 cqr, 实测分红与送转除权日均标注); 对每一边界用相邻两段的
   仿射线求除权参考价 ref(连续性 a_b·raw_prev + b_b = a_a·ref + b_a),
   ex_factor = raw_prev / ref。纯分红时 a 相消, 退化为交易所公式
   raw_prev/(raw_prev - D), 与 fuyao/event-dump 语义一致(分红因子 > 1)。
-  不做纯价格残差扫描(任务书原拟的 qfq/raw 比值扫描, 实测不可用):
+  注释列缺失时(2026-10-14 实测: ETF 日K 行固定 6 字段, 无第 7 列注释)改用比值
+  平台判据 `_ratio_plateau_breaks` — 两侧各 ≥5 交易日、段内 CV ≤0.002、台阶 ≥1%。
+  不做逐日比值扫描(任务书原拟口径, 2026-09-30 实测不可用):
   600519 503 个交易日逐日比值抖动 ~1e-3 >> 1e-4 容差, 扫描产出 336 个伪事件
   (真实 4 个); 且事件日 cum 上跳(qfq/raw → 1), 任务书公式 cum_prev/cum_t < 1,
   方向与 enriched 管道(pre/post 比值, 分红因子 > 1)相反 — 双重不可用。
   实测验证: 纯分红(600519 四次)段内 qfq-raw 恒定、事件步长恰为注释 fh_sh/10;
   派+转混合(sz300661 "10派2元转3股")段内斜率 = 1/1.3、边界因子与交易所公式
-  一致(1e-6)。宁可漏不可错: 若腾讯存在未注释事件则该事件缺失(有界缺口,
-  不产出错误因子), 推导失败的注释事件有告警日志。
+  一致(1e-6)。宁可漏不可错: 判据不达标即不出因子(错因子会污染全部下游前复权链路,
+  代价高于漏), 推导失败有告警日志。
 """
 
 from __future__ import annotations
@@ -83,6 +85,10 @@ _ADJ_MIN_ALIGNED_DAYS = 3  # 对齐日期数低于此无法推导
 _ADJ_IDENTITY_EPS = 0.002  # 最新段单日 qfq≈raw 判定恒等线的容差
 _ADJ_FACTOR_MIN = 0.25  # 因子合理界(超出视为推导失败, 剔除并告警)
 _ADJ_FACTOR_MAX = 4.0
+# 无除权注释列资产(实测 ETF 日K 行固定 6 字段)的事件判据: qfq/raw 比值平台跳变。
+_RATIO_MIN_SIDE_DAYS = 5  # 断点两侧各需的交易日数, 证据不足不猜(宁可漏不错)
+_RATIO_CV_MAX = 0.002  # 段内比值离散上限; 实测 510880 最紧 0.00047, 留 4 倍余量
+_RATIO_JUMP_MIN = 0.01  # 平台间最小跳变; 逐日舍入抖动 ~1e-3 进不了这道门
 _MINUTE_MAX_PAGES = 40
 _DEPTH_BATCH = 60  # qt.gtimg 单批代码数(88 字段/只, URL 长度取保守值)
 _DEPTH_BATCH_INTERVAL_S = 0.3
@@ -356,6 +362,55 @@ def _segment_starts(days: list[date], annotated: set[date]) -> list[int]:
     """
     pos = {d: i for i, d in enumerate(days)}
     return sorted({0, *{pos[d] for d in annotated if d in pos}})
+
+
+def _ratio_plateau_breaks(
+    days: list[date], raw_map: dict[date, float], qfq_map: dict[date, float]
+) -> list[int]:
+    """无除权注释列资产的事件判据: qfq/raw 比值的一次台阶, 返回候选断点下标。
+
+    实测腾讯 ETF 日K 行只有 6 个字段(无注释列), 注释判据对 ETF 恒为 False →
+    只认注释的分段器对 ETF 永远返回 0 事件, 前复权价退化成原始价。
+    ETF 的拆分与现金分红在 qfq 序列里都表现为整段等比: 实测 159558 拆 3 →
+    比值 3.0000→1.0(CV 0.00022)、510880 每份分红 0.143 → 1.0469→1.0(CV 0.00037)。
+
+    与 2026-09-30 被否决的"逐日比值扫描"区别在判据本身: 逐日比对配 1e-4 容差会被
+    三位小数舍入噪声打穿(600519 抖动 ~1e-3, 伪事件 336 个); 这里比的是两侧窗口的
+    均值台阶并要求段内离散度达标, 同量级抖动过不了 1% 跳变门。
+    """
+    n = len(days)
+    w = _RATIO_MIN_SIDE_DAYS
+    if n < 2 * w:
+        return []
+    ratios = [raw_map[d] / qfq_map[d] for d in days]
+
+    def _plateau(xs: list[float]) -> tuple[float, float] | None:
+        mean = sum(xs) / len(xs)
+        if mean <= 0:
+            return None
+        var = sum((x - mean) ** 2 for x in xs) / len(xs)
+        return mean, var ** 0.5 / mean
+
+    cands: list[tuple[int, float]] = []
+    for i in range(w, n - w + 1):
+        below, above = _plateau(ratios[i - w : i]), _plateau(ratios[i : i + w])
+        if below is None or above is None:
+            continue
+        if max(below[1], above[1]) > _RATIO_CV_MAX:
+            continue
+        jump = abs(below[0] / above[0] - 1)
+        if jump < _RATIO_JUMP_MIN:
+            continue
+        cands.append((i, jump))
+
+    out: list[tuple[int, float]] = []
+    for i, jump in cands:  # 真实断点的次日会因窗口重叠再次入选, 同簇保留跳变最大者
+        if out and i - out[-1][0] < w:
+            if jump > out[-1][1]:
+                out[-1] = (i, jump)
+            continue
+        out.append((i, jump))
+    return [i for i, _jump in out]
 
 
 class CnFreeProvider:
@@ -855,7 +910,18 @@ class CnFreeProvider:
         if len(days) < _ADJ_MIN_ALIGNED_DAYS:
             return []  # 数据不足(如 ETF 无事件、qfq 深度不足), 不伪造
 
-        starts = _segment_starts(days, annotated)
+        if annotated:
+            starts = _segment_starts(days, annotated)
+        else:
+            # 注释列缺失(实测全部 ETF): 退到比值平台判据, 否则该类别永远 0 事件。
+            breaks = _ratio_plateau_breaks(days, raw_map, qfq_map)
+            if breaks:
+                logger.info(
+                    "cnfree 除权因子: %s 无注释列, 按比值平台推断候选断点 %s",
+                    symbol,
+                    ", ".join(str(days[i]) for i in breaks),
+                )
+            starts = sorted({0, *breaks})
         seg_bounds = [
             (starts[k], starts[k + 1] if k + 1 < len(starts) else len(days))
             for k in range(len(starts))

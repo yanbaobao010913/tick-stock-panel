@@ -1,10 +1,5 @@
 // @vitest-environment jsdom
-// 策略设置弹窗 (分区导航版) 交互回归:
-// - 左侧分区导航: 默认「策略条件」页, 点击切换页面显隐
-// - 「未保存的改动」提示: 编辑出现 (导航圆点 + 底部文案), 改回原值即消失
-// - 保存 payload: 名称/基础参数/评分/叠加条件按后端契约组装
-// - 分钟策略: 叠加条件区显示「不支持」文案
-// - 叠加策略: 导航只剩「子策略与权重」
+// 简化分栏布局下验证真实编辑、PATCH 保存、重置及切换行为。
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { MemoryRouter } from 'react-router-dom'
@@ -15,14 +10,18 @@ import type { StrategyDetail } from '@/lib/api'
 
 const mocks = vi.hoisted(() => ({
   saveConfig: vi.fn(async (_id: string, _payload: Record<string, unknown>) => ({ ok: true })),
+  patchConfig: vi.fn(async (_id: string, _payload: Record<string, unknown>) => ({ ok: true })),
+  getStrategy: vi.fn(async (_id: string): Promise<unknown> => mocks.detail),
+  resetConfig: vi.fn(async () => ({ ok: true })),
   detail: null as unknown,
 }))
 
 vi.mock('@/lib/api', () => ({
   api: {
-    strategyGet: vi.fn(async () => mocks.detail),
+    strategyGet: mocks.getStrategy,
     strategySaveConfig: mocks.saveConfig,
-    strategyResetConfig: vi.fn(async () => ({ ok: true })),
+    strategyPatchConfig: mocks.patchConfig,
+    strategyResetConfig: mocks.resetConfig,
     strategyDelete: vi.fn(async () => ({ ok: true })),
     strategyGetSource: vi.fn(async () => ({ code: '', source: 'custom' })),
     customSignalsOptions: vi.fn(async () => ({ fields: [{ key: 'close', label: '收盘价' }], groups: [], stringFields: [] })),
@@ -69,15 +68,15 @@ let root: Root | null = null
 const container = document.createElement('div')
 document.body.appendChild(container)
 
-async function render(props: { onClose?: () => void } = {}) {
+let queryClient: QueryClient
+async function render(props: { onClose?: () => void; strategyId?: string } = {}) {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  root = createRoot(container)
+  root ??= createRoot(container)
   await act(async () => {
     root!.render(
-      <MemoryRouter>
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <QueryClientProvider client={queryClient}>
-          <StrategySettingsDialog strategyId="test_strategy" onClose={props.onClose ?? (() => {})} />
+          <StrategySettingsDialog strategyId={props.strategyId ?? 'test_strategy'} onClose={props.onClose ?? (() => {})} />
         </QueryClientProvider>
       </MemoryRouter>,
     )
@@ -89,13 +88,6 @@ async function render(props: { onClose?: () => void } = {}) {
 const findButton = (text: string) =>
   [...container.querySelectorAll('button')].find(b => b.textContent?.includes(text))!
 
-// 分区页判隐: 页说明段落 → 内层容器 → 页 wrapper
-function pageHidden(introText: string) {
-  const p = [...container.querySelectorAll('p')].find(el => el.textContent?.includes(introText))
-  if (!p) throw new Error(`page intro not found: ${introText}`)
-  return p.parentElement!.parentElement!.className.includes('hidden')
-}
-
 function setNumberInput(input: HTMLInputElement, v: string) {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
   act(() => {
@@ -106,42 +98,55 @@ function setNumberInput(input: HTMLInputElement, v: string) {
 
 beforeEach(() => {
   mocks.saveConfig.mockClear()
+  mocks.patchConfig.mockReset().mockResolvedValue({ ok: true })
+  mocks.getStrategy.mockReset().mockImplementation(async () => mocks.detail)
+  mocks.resetConfig.mockReset().mockResolvedValue({ ok: true })
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   mocks.detail = makeDetail()
+})
+
+it('editing only the name patches config while preserving existing risk and overlay values', async () => {
+  mocks.detail = makeDetail({
+    take_profit: 0.15, trailing_stop: 0.06,
+    trailing_take_profit_activate: 0.2, trailing_take_profit_drawdown: 0.05,
+    overlay_filter: [{ left: 'close', op: '>', right: 'ma_20', leftDays: 3, rightDays: 1 }],
+  })
+  await render()
+  setNumberInput(container.querySelector<HTMLInputElement>('input[type="text"]')!, '改名')
+  await act(async () => { findButton('保存设置').click() })
+  expect(mocks.saveConfig).not.toHaveBeenCalled()
+  expect(mocks.patchConfig).toHaveBeenCalledWith('test_strategy', expect.objectContaining({
+    name: '改名', stop_loss: -0.08, take_profit: 0.15, trailing_stop: 0.06,
+    trailing_take_profit_activate: 0.2, trailing_take_profit_drawdown: 0.05,
+    overlay_filter: [{ left: 'close', op: '>', right: 'ma_20', leftDays: 3, rightDays: 1 }],
+  }))
 })
 afterEach(() => {
   if (root) { act(() => { root!.unmount() }); root = null }
   container.innerHTML = ''
+  queryClient.clear()
 })
 
-it('renders section nav with 策略条件 page active by default', async () => {
+it('shows basic, overlay, scoring and trading controls together in the simplified layout', async () => {
   await render()
 
-  expect(container.textContent).toContain('策略条件')
-  expect(container.textContent).toContain('策略权重')
-  expect(container.textContent).toContain('风控触发')
+  expect(container.querySelector('nav')).toBeNull()
   expect(container.textContent).toContain('基础参数')
   expect(container.textContent).toContain('叠加条件')
-  // 默认页可见, 其他分区隐藏 (常驻挂载避免编辑草稿丢失)
-  expect(pageHidden('决定哪些股票进入候选')).toBe(false)
-  expect(pageHidden('对通过筛选的候选按因子加权打分排序')).toBe(true)
-  expect(pageHidden('控制买卖时点')).toBe(true)
+  expect(container.textContent).toContain('评分权重')
+  expect(container.textContent).toContain('交易参数')
 })
 
-it('switches pages through the nav rail', async () => {
+it('collapsing and reopening a section retains its edited values', async () => {
   await render()
-
-  act(() => { findButton('策略权重').click() })
-  expect(pageHidden('对通过筛选的候选按因子加权打分排序')).toBe(false)
-  expect(pageHidden('决定哪些股票进入候选')).toBe(true)
-
-  act(() => { findButton('风控触发').click() })
-  expect(pageHidden('控制买卖时点')).toBe(false)
-  expect(pageHidden('对通过筛选的候选按因子加权打分排序')).toBe(true)
+  setNumberInput(container.querySelector<HTMLInputElement>('input[aria-label="止盈"]')!, '15')
+  act(() => { findButton('交易参数').click() })
+  act(() => { findButton('交易参数').click() })
+  expect(container.querySelector<HTMLInputElement>('input[aria-label="止盈"]')!.value).toBe('15')
 })
 
 it('shows unsaved-change hint on edit and clears it when reverted', async () => {
   await render()
-  act(() => { findButton('风控触发').click() })
 
   const stopLabel = [...container.querySelectorAll('span')].find(s => s.textContent === '止损')!
   const stopInput = stopLabel.parentElement!.querySelector('input[type="number"]') as HTMLInputElement
@@ -151,17 +156,13 @@ it('shows unsaved-change hint on edit and clears it when reverted', async () => 
 
   setNumberInput(stopInput, '9')
   expect(container.textContent).toContain('有未保存的改动')
-  const navBtn = [...container.querySelectorAll('nav button')].find(b => b.textContent?.includes('风控触发'))!
-  expect(navBtn.querySelector('.bg-amber-400')).toBeTruthy()
 
   setNumberInput(stopInput, '8')
   expect(container.textContent).not.toContain('有未保存的改动')
-  expect(navBtn.querySelector('.bg-amber-400')).toBeFalsy()
 })
 
 it('trading page exposes full risk fields and save carries them', async () => {
   await render()
-  act(() => { findButton('风控触发').click() })
 
   // 与回测抽屉同构的 6 项纪律字段
   for (
@@ -178,7 +179,7 @@ const label of ['止损', '止盈', '移动止损', '回撤止盈启动', '回�
   setNumberInput(tdLabel.parentElement!.querySelector('input[type="number"]') as HTMLInputElement, '5')
 
   await act(async () => { findButton('保存设置').click() })
-  const [, payload] = mocks.saveConfig.mock.calls[0]
+  const [, payload] = mocks.patchConfig.mock.calls[0]
   expect(payload).toMatchObject({
     stop_loss: -0.08,
     take_profit: 0.15,
@@ -190,7 +191,6 @@ const label of ['止损', '止盈', '移动止损', '回撤止盈启动', '回�
 
 it('drawdown clamps to activate value (与回测抽屉同联动)', async () => {
   await render()
-  act(() => { findButton('风控触发').click() })
 
   const taLabel = [...container.querySelectorAll('span')].find(s => s.textContent === '回撤止盈启动')!
   const tdLabel = [...container.querySelectorAll('span')].find(s => s.textContent === '回撤止盈回撤')!
@@ -207,8 +207,8 @@ it('save submits assembled payload and closes', async () => {
 
   await act(async () => { findButton('保存设置').click() })
 
-  expect(mocks.saveConfig).toHaveBeenCalledTimes(1)
-  const [id, payload] = mocks.saveConfig.mock.calls[0]
+  expect(mocks.patchConfig).toHaveBeenCalledTimes(1)
+  const [id, payload] = mocks.patchConfig.mock.calls[0]
   expect(id).toBe('test_strategy')
   expect(payload).toMatchObject({
     name: '测试策略',
@@ -244,7 +244,7 @@ it('overlay conditions expose 最新/前N日 offset and save carries it', async 
   expect([...container.querySelectorAll('span')].some(s => s.textContent === '前')).toBe(true)
 
   await act(async () => { findButton('保存设置').click() })
-  const [, payload] = mocks.saveConfig.mock.calls[0]
+  const [, payload] = mocks.patchConfig.mock.calls[0]
   expect((payload.overlay_filter as any[])[0]).toMatchObject({
     left: 'close', op: '>', right: '0', leftDays: 1, rightDays: 0,
   })
@@ -263,7 +263,7 @@ it('the last overlay condition is deletable back to 不叠加', async () => {
   expect(container.textContent).toContain('无条件 — 不叠加过滤')
 
   await act(async () => { findButton('保存设置').click() })
-  const [, payload] = mocks.saveConfig.mock.calls[0]
+  const [, payload] = mocks.patchConfig.mock.calls[0]
   expect(payload.overlay_filter).toEqual([])
 })
 
@@ -276,7 +276,8 @@ it('composite strategy only exposes the children section', async () => {
   await render()
 
   expect(container.textContent).toContain('子策略与权重')
-  expect(container.textContent).not.toContain('策略条件')
-  expect(pageHidden('叠加策略按权重融合子策略')).toBe(false)
+  expect(container.textContent).not.toContain('基础参数')
+  expect(container.textContent).not.toContain('交易参数')
+  expect(container.textContent).not.toContain('叠加条件')
   expect(container.textContent).toContain('子策略A')
 })

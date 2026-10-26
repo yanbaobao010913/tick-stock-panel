@@ -2,8 +2,8 @@
 
 复现的原始问题 (2026-10-07): panel 模式/残留后端占住 data_dir/.mining_process.lock,
 桌面版 lifespan 抢锁失败被 uvicorn 吞掉, 主线程傻等 150s 后只显示笼统的
-"启动超时", 真因不可见。修复 = 预检秒失败 + 等待循环感知后端线程退出 +
-失败页透传原因。
+"启动超时", 真因不可见。保留等待循环感知后端退出和失败页透传原因;
+挖掘锁冲突随上游改为降级启动, 预检保留诊断日志与 panel 停止指引。
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+import app.desktop as desktop
 from app.config import settings
 from app.desktop import (
     _failed_html,
@@ -92,5 +93,45 @@ def test_precheck_mining_lock_detects_conflict(data_dir):
     assert reason is not None
     # 失败页要给出可操作的下一步, 不是一句"无法启动"
     assert "panel.cmd stop" in reason
+    assert "结束残留的 python" in reason
     holder.release()
     assert _precheck_mining_lock() is None
+
+
+# ---------- main() 预检冲突路径 ----------
+
+def test_main_proceeds_when_mining_lock_precheck_conflicts(
+    tmp_path, monkeypatch, caplog
+):
+    """预检撞锁只降级: 留 WARNING 日志并继续启动, 不再提前退出失败页。
+
+    lifespan 会以降级模式起面板 (挖掘入口 409, 挖掘页提供强制释放),
+    桌面版必须照常开窗, 否则用户没有入口处理锁冲突。
+    """
+    import logging
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path, raising=False)
+    monkeypatch.setattr(desktop, "_guard_streams", lambda: None)
+    monkeypatch.setattr(desktop, "_setup_logging", lambda: None)
+    monkeypatch.setattr(
+        desktop, "_precheck_mining_lock", lambda: "另一个后端实例正在占用数据目录"
+    )
+    monkeypatch.setattr(desktop, "_find_free_port", lambda base: 59998)
+    monkeypatch.setattr(
+        desktop, "_wait_for_server",
+        lambda port, timeout, done_event: True,
+    )
+    opened = []
+    monkeypatch.setattr(desktop, "_open_window", lambda url: opened.append(url))
+
+    def _fake_uvmicorn(port, ready):
+        ready.set()
+
+    monkeypatch.setattr(desktop, "_run_uvmicorn", _fake_uvmicorn)
+
+    with caplog.at_level(logging.WARNING, logger="app.desktop"):
+        assert desktop.main() == 0
+
+    assert opened and opened[0].startswith("http://127.0.0.1:")
+    assert "启动预检" in caplog.text
+    assert not (tmp_path / ".desktop.lock").exists()

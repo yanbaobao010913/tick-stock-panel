@@ -856,6 +856,79 @@ def test_adj_no_event_returns_empty_with_schema(monkeypatch):
     assert df.columns == ["symbol", "trade_date", "ex_factor"]
 
 
+def test_adj_etf_split_ratio_plateau_infers_factor(monkeypatch):
+    """ETF 日K 行没有除权注释列(实测固定 6 字段) → 必须改用 qfq/raw 比值平台跳变推因子。
+
+    复现 2026-10-14 云机实测: 159558.SZ 2026-07-09 一份拆三份, raw/qfq 比值由 3.0000
+    跳到 1.0; 只认注释的分段器对它永远返回 0 事件, ETF 前复权价退化成原始价。
+    """
+    closes = [f"{1.400 + 0.003 * i:.3f}" for i in range(24)]
+    _days, raw_rows, qfq_rows, event_day = _adj_fixture(
+        closes, 10, before=lambda c: round(c / 3, 3), annotate=False
+    )
+    fake = _FakeClient(daily={("sz159558", ""): raw_rows, ("sz159558", "qfq"): qfq_rows})
+    p = _provider_with(monkeypatch, fake)
+    df = p.get_adj_factors(["159558.SZ"], datetime(2026, 8, 24), datetime(2026, 9, 16))
+    # 次一交易日也会出现大台阶但段内方差高(实测 CV 0.11~0.15), 必须被门槛滤掉
+    assert df.height == 1
+    row = df.row(0, named=True)
+    assert row["symbol"] == "159558.SZ"
+    assert row["trade_date"] == event_day
+    assert row["ex_factor"] == pytest.approx(3.0, rel=1e-3)
+
+
+def test_adj_etf_cash_dividend_ratio_plateau_infers_factor(monkeypatch):
+    """现金分红型 ETF 同样是比值平台(实测 510880.SH 2026-01-21 每份 0.143 元 → 比值 1.0469)。"""
+    closes = [f"{3.050 + 0.012 * i:.3f}" for i in range(24)]
+    _days, raw_rows, qfq_rows, event_day = _adj_fixture(
+        closes, 12, before=lambda c: round(c / 1.0469, 3), annotate=False
+    )
+    fake = _FakeClient(daily={("sh510880", ""): raw_rows, ("sh510880", "qfq"): qfq_rows})
+    p = _provider_with(monkeypatch, fake)
+    df = p.get_adj_factors(["510880.SH"], datetime(2026, 8, 24), datetime(2026, 9, 16))
+    assert df.height == 1
+    assert df["trade_date"][0] == event_day
+    assert df["ex_factor"][0] == pytest.approx(1.0469, rel=1e-3)
+    assert df["ex_factor"][0] > 1.0
+
+
+def test_adj_etf_uptrend_without_event_infers_nothing(monkeypatch):
+    """单边上涨但 qfq/raw 恒等的 ETF 不得被当成事件(误报代价高于漏报)。"""
+    closes = [f"{1.400 + 0.026 * i:.3f}" for i in range(24)]
+    _days, raw_rows, qfq_rows, _event = _adj_fixture(closes, 12, annotate=False)
+    fake = _FakeClient(daily={("sz159915", ""): raw_rows, ("sz159915", "qfq"): qfq_rows})
+    p = _provider_with(monkeypatch, fake)
+    df = p.get_adj_factors(["159915.SZ"], datetime(2026, 8, 24), datetime(2026, 9, 16))
+    assert df.is_empty()
+    assert df.columns == ["symbol", "trade_date", "ex_factor"]
+
+
+def test_adj_etf_break_too_close_to_window_edge_is_not_fabricated(monkeypatch):
+    """平台断点两侧证据不足(实测每侧至少 5 个交易日才认) → 宁可不出因子。"""
+    closes = [f"{1.400 + 0.003 * i:.3f}" for i in range(24)]
+    _days, raw_rows, qfq_rows, _event = _adj_fixture(
+        closes, 3, before=lambda c: round(c / 2, 3), annotate=False
+    )
+    fake = _FakeClient(daily={("sz159813", ""): raw_rows, ("sz159813", "qfq"): qfq_rows})
+    p = _provider_with(monkeypatch, fake)
+    df = p.get_adj_factors(["159813.SZ"], datetime(2026, 8, 24), datetime(2026, 9, 16))
+    assert df.is_empty()
+
+
+def test_adj_annotation_present_never_uses_ratio_inference(monkeypatch):
+    """注释列存在时不得叠加比值推断: 减法分红段的 qfq/raw 本身随价漂移,
+    若一并扫描会产出伪事件(2026-09-30 否决逐日比值扫描的同一失效模式)。"""
+    closes = [f"{10.00 + 0.35 * i:.2f}" for i in range(24)]
+    _days, raw_rows, qfq_rows, event_day = _adj_fixture(
+        closes, 10, before=lambda c: c - 0.30
+    )
+    fake = _FakeClient(daily={("sh600519", ""): raw_rows, ("sh600519", "qfq"): qfq_rows})
+    p = _provider_with(monkeypatch, fake)
+    df = p.get_adj_factors(["600519.SH"], datetime(2026, 8, 24), datetime(2026, 9, 16))
+    assert df.height == 1
+    assert df["trade_date"][0] == event_day
+
+
 def test_adj_no_price_impact_annotation_filtered_by_tolerance(monkeypatch):
     """注释存在但两侧同线(无实际除权影响) → 因子 ~1, 被容差过滤, 不产出伪事件。"""
     _days, raw_rows, qfq_rows, _event = _adj_fixture(
