@@ -2,7 +2,7 @@
 
 本文件记录 fork 相对上游的**行为保证**,用于每次同步上游时逐项核对,避免"文本无冲突但行为丢失"。
 
-基线:上游 `v0.3.9`(合并提交 `3b069bda`,回补提交 `8372a2e4`)。上游仓库 `origin` = `shy3130/tick-stock-panel`,fork = `yanbaobao010913/tick-stock-panel`。
+基线:本次同步上游 `v0.3.18`(`b08a267a`),定制侧起点 `fcc8cf8b`。上次 `v0.3.9` 的合并提交为 `3b069bda`,回补提交为 `8372a2e4`。上游仓库 `origin` = `shy3130/tick-stock-panel`,fork = `yanbaobao010913-beep/tick-stock-panel`。
 
 ## 1. 同步流程
 
@@ -31,7 +31,7 @@ cd ../frontend && pnpm build
 
 | 保证 | 实现 | 守护测试 |
 | --- | --- | --- |
-| 桌面版启动失败页(后端提前退出/超时) | `backend/app/desktop.py` `_failed_html` / `_precheck_mining_lock` / `_open_static_window` | `test_desktop_startup.py` |
+| 桌面版启动失败页(后端提前退出/超时);挖掘锁冲突按上游降级启动,保留 panel 停止指引 | `backend/app/desktop.py` `_failed_html` / `_precheck_mining_lock` / `_open_static_window` | `test_desktop_startup.py` |
 | 自定义分钟源分块流式落盘(内存峰值从全量降到单段) | `backend/app/services/kline_sync.py` `_CUSTOM_MINUTE_CHUNK` | `test_minute_custom_streaming_persist.py` |
 | 标的维表 fail-closed(部分交易所失败不覆盖旧表) | `backend/app/services/instrument_sync.py` `_EXCHANGE_RETRIES` + `sync_instruments` | `test_instrument_sync_failclosed.py` |
 | 分钟同步门控与 `api/kline._minute_allowed` 一致(自定义源声明 dataset 即放行) | `backend/app/jobs/daily_pipeline.py` `minute_allowed` | `test_daily_pipeline_minute_gate.py` |
@@ -42,14 +42,14 @@ cd ../frontend && pnpm build
 
 ### 已提交上游的通用修复 (2026-10-20)
 
-以下修复与 DSA/cnfree 无关, 已作为独立 PR 提交上游。上游合并后, 同步时直接采用上游实现并删除本文件的对应条目:
+以下修复与 DSA/cnfree 无关,已作为独立 PR 提交上游。2026-10-26 核实:三项已合并并包含在 v0.3.18,一项仍未合并。已吸收项沿用上游后续修正,不再重复回补旧实现;行为保证与回归测试继续保留。
 
-| 修复 | 上游 PR |
-| --- | --- |
-| 标的维表 fail-closed(部分交易所失败不覆盖旧表) | #495 |
-| 自定义分钟源按块流式落盘 | #496 |
-| 桌面启动失败页 + 挖掘锁预检 | #497 |
-| 盘后分钟门控与 `api/kline` 对齐 | #498 |
+| 修复 | 上游 PR | 本次处理 |
+| --- | --- | --- |
+| 标的维表 fail-closed(部分交易所失败不覆盖旧表) | #495,仍 OPEN | 保留 fork 交易所重试和旧维表保护,与上游新增股本补齐组合 |
+| 自定义分钟源按块流式落盘 | #496,已合并 | 保留分块,同时采用上游自定义源失败不跨源回退契约 |
+| 桌面启动失败页 + 挖掘锁预检 | #497,已合并 | 保留诊断和 panel 指引,采用上游锁冲突降级启动及新日志目录 |
+| 盘后分钟门控与 `api/kline` 对齐 | #498,已合并 | 采用同等门控,同时覆盖 cnfree 和普通自定义源 |
 
 ## 3. 前端页面注册(v0.3.9 起已迁移到扩展)
 
@@ -63,6 +63,7 @@ v0.3.6 起上游采用「核心 + 扩展」架构:页面、路由、侧栏导航
   - `custom/paper/extension.tsx`:新账户默认资金 10 万;
   - `custom/stock-analysis/extension.tsx`:页面底部注入 `DsaAnalysisSection`;
   - `custom/lots/extension.tsx`:仅保留路由,不注册「持仓提醒」导航项(DSA 报告点位已覆盖手动批次提醒)。
+- 助手继续默认非模态,页面可交互;上游新增遮罩仅作为显式开启的偏好,前后端默认值一致为关闭。
 
 ## 4. 已知 L3 改动区(每次同步必须人工复核)
 
@@ -93,15 +94,17 @@ git diff --numstat origin/main...HEAD | sort -k1,1nr   # 按改动量排序
 
 ## 5. 上游 PR 候选
 
-通用改进,上游吸收后即可删除本地回补(删除前须确认**正式发布版本**包含,而不是只看上游默认分支):
-
-- 标的维表同步 fail-closed(部分失败不覆盖旧表);
-- 自定义分钟源分块流式落盘;
-- 桌面启动失败页与挖掘锁预检;
-- 分钟同步门控与 `api/kline._minute_allowed` 对齐(上游自身口径不一致)。
+尚待上游吸收的通用改进:标的维表同步 fail-closed(部分失败不覆盖旧表),见 #495。删除本地回补前须确认**正式发布版本**包含对应行为,而不是只看上游默认分支。其余三项见上表。
 
 ## 6. 版本与发布
 
-- 上游基线记 Git tag(`v0.3.9`),不等于发行版本。
+- 上游基线记 Git tag(`v0.3.18`),不等于发行版本。
 - Docker 走 `fork/main` push 自动构建;桌面安装包走 `release.yml`(`workflow_dispatch`),要求传入版本等于 `frontend/package.json`。
-- 版本已对齐上游基线 0.3.9:`frontend/package.json`、`backend/pyproject.toml`、`VERSION`、`release.yml` 默认值同源,发版前只需改这一处基线。
+- 本次对齐 0.3.18:`frontend/package.json` 为运行时版本权威,同时同步 `backend/pyproject.toml`、`uv.lock` 的本项目版本、`VERSION`、后端回退版本与 `release.yml` 默认值。
+
+## 7. v0.3.18 同步注意项
+
+- 完整记录见 [升级核查与验收](./upstream-upgrade-20261026.md),包含冲突清单和实际验证。
+- 正式目录尚未提交的 cnfree ETF 复权平台检测修复及其五个测试已按原补丁带入;没有覆盖正式目录或清除原修改。
+- 回测合并需同时保留 DSA 逐格介入/止损/止盈和上游共享面板准备;overlay 只作用于只读二维入场信号,不能重复广播到一维时间掩码。
+- Windows 备份恢复须按原始字节原子写入,避免 CRLF 被再次翻译;发布锁存活探测用 `psutil.pid_exists`,不得调用 Windows 的 `os.kill(pid, 0)`。

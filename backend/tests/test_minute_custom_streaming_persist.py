@@ -83,8 +83,8 @@ def test_persist_path_empty_symbols_no_calls(monkeypatch):
     assert out.is_empty()
 
 
-def test_persist_path_falls_through_to_tickflow_on_provider_failure(monkeypatch):
-    """任一块 fallback → 整体落到 TickFlow 路径 (原语义), 不再调用剩余块。
+def test_persist_path_uses_tickflow_when_explicitly_selected(monkeypatch):
+    """fallback 只表示明确选择 TickFlow, 不再调用剩余自定义分块。
     get_client 打桩避免真实网络; TickFlow 路径以"已调用"为断言即可。"""
     calls: list[list[str]] = []
     segs: list[pl.DataFrame] = []
@@ -111,6 +111,37 @@ def test_persist_path_falls_through_to_tickflow_on_provider_failure(monkeypatch)
     )
     assert len(calls) == 1  # 首块即 fallback, 不空打剩余块
     assert segs == []
+
+
+def test_custom_provider_failure_keeps_persisted_chunks_without_cross_source(monkeypatch):
+    """已落盘首块保留; 次块自定义源失败不能切到 TickFlow 补齐。"""
+    calls: list[list[str]] = []
+    segs: list[pl.DataFrame] = []
+
+    class Provider:
+        def get_minute(self, symbols, **kwargs):
+            calls.append(list(symbols))
+            if len(calls) == 2:
+                raise RuntimeError("custom source unavailable")
+            return _minute_df(symbols)
+
+    monkeypatch.setattr(kline_sync, "_selected_minute_provider_name", lambda: "customsrc")
+    monkeypatch.setattr(
+        kline_sync, "_resolve_minute_provider", lambda name: (Provider(), False, None)
+    )
+    monkeypatch.setattr(kline_sync, "_CUSTOM_MINUTE_CHUNK", 50)
+
+    def unexpected_tickflow():
+        raise AssertionError("custom provider failure must not request TickFlow")
+
+    monkeypatch.setattr(kline_sync, "get_client", unexpected_tickflow)
+    out = kline_sync.sync_minute_batch(
+        [f"{i:06d}.SZ" for i in range(60)], on_segment=segs.append
+    )
+
+    assert [len(chunk) for chunk in calls] == [50, 10]
+    assert len(segs) == 1 and segs[0].height == 50
+    assert out.is_empty()
 
 
 def test_no_segment_path_returns_df_directly(monkeypatch):

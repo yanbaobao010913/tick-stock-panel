@@ -17,38 +17,34 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { Eye, EyeOff, ExternalLink, GripVertical, Settings, Bell } from 'lucide-react'
+import { Eye, EyeOff, ExternalLink, GripVertical, Settings, Bell, Trash2 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '@/lib/api'
+import { setUiPref } from '@/lib/uiPrefs'
+import { toast } from '@/components/Toast'
 import { QK } from '@/lib/queryKeys'
 import { usePreferences } from '@/lib/useSharedQueries'
+import { getFrontendExtensionNavigation } from '@/extensions/registry'
+import { compareByDefaultNav, defaultNavIndex } from '@/lib/navOrder'
 
 interface NavEntry {
   id: string
   label: string
-  type: 'builtin' | 'analysis'
+  type: 'builtin' | 'analysis' | 'extension'
   visible: boolean
+  /** 源码扩展命名空间 (frontend/src/custom/<ns>/), 仅 type=extension 有值; 物理删除的凭据 */
+  extensionId?: string
 }
 
-// 与 Layout 侧边栏默认顺序保持一致 (nav_order 未保存时的默认展示顺序)
+// 核心页清单; nav_order 未保存时的完整默认顺序以 lib/navOrder 基准为准
+// (含迁移到 custom/ 的扩展域页面, 保证老用户升级侧栏顺序无感)
 const BUILTIN_PAGES: NavEntry[] = [
   { id: '/', label: '看板', type: 'builtin', visible: true },
   { id: '/watchlist', label: '自选', type: 'builtin', visible: true },
   { id: '/screener', label: '策略', type: 'builtin', visible: true },
   { id: '/factors', label: '因子', type: 'builtin', visible: true },
   { id: '/backtest', label: '回测', type: 'builtin', visible: true },
-  { id: '/stock-analysis', label: '个股分析', type: 'builtin', visible: true },
-  { id: '/limit-ladder', label: '连板梯队', type: 'builtin', visible: true },
-  { id: '/concept-analysis', label: '概念分析', type: 'builtin', visible: true },
-  { id: '/industry-analysis', label: '行业分析', type: 'builtin', visible: true },
-  { id: '/financials', label: '财务分析', type: 'builtin', visible: true },
-  { id: '/monitor', label: '监控中心', type: 'builtin', visible: true },
   { id: '/regime', label: '市场环境', type: 'builtin', visible: true },
-  { id: '/abnormal', label: '异动监控', type: 'builtin', visible: true },
-  { id: '/lots', label: '持仓提醒', type: 'builtin', visible: true },
-  { id: '/paper', label: '模拟盘', type: 'builtin', visible: true },
-  { id: '/signals', label: '信号库', type: 'builtin', visible: true },
-  { id: '/review', label: '复盘', type: 'builtin', visible: true },
   { id: '/indices', label: '指数', type: 'builtin', visible: true },
   { id: '/data', label: '数据', type: 'builtin', visible: true },
 ]
@@ -85,12 +81,14 @@ const archOf = (entry: NavEntry): { kind: ArchKind; reason: string } =>
 
 // ── Sortable row ──
 
-function SortableItem({ entry, hidden, onToggleHidden, badgeEnabled, onToggleBadge }: {
+function SortableItem({ entry, hidden, onToggleHidden, badgeEnabled, onToggleBadge, onRemove }: {
   entry: NavEntry
   hidden: boolean
   onToggleHidden: (id: string) => void
   badgeEnabled?: boolean
   onToggleBadge?: (id: string) => void
+  /** 删除源码扩展页 (物理删除 frontend/src/custom/<extensionId>/, 先备份) */
+  onRemove?: (entry: NavEntry) => void
 }) {
   const {
     attributes,
@@ -112,7 +110,7 @@ function SortableItem({ entry, hidden, onToggleHidden, badgeEnabled, onToggleBad
     <div
       ref={setNodeRef}
       style={style}
-      className={`grid grid-cols-[2.5rem_1fr_4.5rem_3rem_3rem_3rem] items-center border-b border-border/70 px-4 py-3 last:border-b-0 ${
+      className={`grid grid-cols-[2.5rem_1fr_4.5rem_3rem_4.5rem_3rem] items-center border-b border-border/70 px-4 py-3 last:border-b-0 ${
         isDragging ? 'bg-elevated rounded-lg shadow-lg' : ''
       } ${hidden ? 'opacity-50' : ''}`}
     >
@@ -167,8 +165,16 @@ function SortableItem({ entry, hidden, onToggleHidden, badgeEnabled, onToggleBad
           {hidden ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
         </button>
       </div>
-      <div className="flex justify-center">
-        {entry.type === 'builtin' ? (
+      <div className="flex justify-center gap-1">
+        {entry.type === 'analysis' ? (
+          <Link
+            to={`/settings?tab=pages&section=ext-pages`}
+            className="rounded p-1 text-muted hover:text-accent hover:bg-accent/10 transition-colors"
+            title="编辑扩展页面"
+          >
+            <Settings className="h-3.5 w-3.5" />
+          </Link>
+        ) : (
           <Link
             to={entry.id}
             className="rounded p-1 text-muted hover:text-accent hover:bg-accent/10 transition-colors"
@@ -176,14 +182,16 @@ function SortableItem({ entry, hidden, onToggleHidden, badgeEnabled, onToggleBad
           >
             <ExternalLink className="h-3.5 w-3.5" />
           </Link>
-        ) : (
-          <Link
-            to={`/settings?tab=ext-pages`}
-            className="rounded p-1 text-muted hover:text-accent hover:bg-accent/10 transition-colors"
-            title="编辑扩展页面"
+        )}
+        {onRemove && entry.extensionId && (
+          <button
+            type="button"
+            onClick={() => onRemove(entry)}
+            className="rounded p-1 text-muted hover:bg-danger/10 hover:text-danger transition-colors"
+            title={`删除源码扩展页 (物理删除 frontend/src/custom/${entry.extensionId}/, 自动备份)`}
           >
-            <Settings className="h-3.5 w-3.5" />
-          </Link>
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
         )}
       </div>
       {/* 第 6 列: 徽标开关 (仅监控中心) */}
@@ -220,13 +228,33 @@ export function SettingsMenuSettingsPanel() {
     visible: m.visible,
   }))
 
+  // 扩展导航 (frontend/src/custom/*/extension.tsx 注册): id 取路由 path,
+  // 与 Layout 侧边栏 nav_order / nav_hidden 按 to 匹配的口径一致。
+  // removedNs: 本次会话已物理删除的命名空间 — 注册表是启动期冻结快照,
+  // 刷新页面前需本地过滤, 否则已删除的行会残留。
+  const [removedNs, setRemovedNs] = useState<Set<string>>(new Set())
+  const extensionEntries: NavEntry[] = getFrontendExtensionNavigation()
+    .filter(item => !removedNs.has(item.extensionId))
+    .map(item => ({
+      id: item.route.path,
+      label: item.label,
+      type: 'extension' as const,
+      visible: true,
+      extensionId: item.extensionId,
+    }))
+
   const allEntries = useMemo(() => {
     const saved = prefs?.nav_order ?? []
     const entryMap = new Map<string, NavEntry>()
     for (const e of BUILTIN_PAGES) entryMap.set(e.id, e)
     for (const e of analysisEntries) entryMap.set(e.id, e)
+    for (const e of extensionEntries) entryMap.set(e.id, e)
 
-    if (saved.length === 0) return [...BUILTIN_PAGES, ...analysisEntries]
+    // 无保存排序: 按迁移前默认基准排序 (扩展域页面不沉底, 老用户升级无感)
+    if (saved.length === 0) {
+      return [...BUILTIN_PAGES, ...analysisEntries, ...extensionEntries]
+        .sort((a, b) => compareByDefaultNav(a.id, b.id))
+    }
 
     const ordered: NavEntry[] = []
     const seen = new Set<string>()
@@ -237,22 +265,22 @@ export function SettingsMenuSettingsPanel() {
         seen.add(id)
       }
     }
-    for (const e of [...BUILTIN_PAGES, ...analysisEntries]) {
+    for (const e of [...BUILTIN_PAGES, ...analysisEntries, ...extensionEntries]) {
       if (seen.has(e.id)) continue
-      // 未保存过排序的新条目: 内置页插回默认位置, 分析菜单追加到末尾
-      const defaultIndex = BUILTIN_PAGES.findIndex(p => p.id === e.id)
+      // 未保存过排序的新条目: 默认基准内的路径插回默认位置, 其余追加到末尾
+      const di = defaultNavIndex(e.id)
       let anchor = -1
-      if (defaultIndex > 0) {
-        for (let i = defaultIndex - 1; i >= 0 && anchor < 0; i -= 1) {
-          anchor = ordered.findIndex(o => o.id === BUILTIN_PAGES[i].id)
+      if (Number.isFinite(di) && di > 0) {
+        for (let i = di - 1; i >= 0 && anchor < 0; i -= 1) {
+          anchor = ordered.findIndex(o => defaultNavIndex(o.id) === i)
         }
       }
       if (anchor >= 0) ordered.splice(anchor + 1, 0, e)
-      else if (defaultIndex >= 0) ordered.unshift(e)
+      else if (di === 0) ordered.unshift(e)
       else ordered.push(e)
     }
     return ordered
-  }, [prefs?.nav_order, analysisEntries])
+  }, [prefs?.nav_order, analysisEntries, extensionEntries])
 
   const hiddenSet = useMemo(() => new Set(prefs?.nav_hidden ?? []), [prefs?.nav_hidden])
 
@@ -270,16 +298,16 @@ export function SettingsMenuSettingsPanel() {
     }
     for (const e of allEntries) {
       if (seen.has(e.id)) continue
-      // 与 allEntries 同一语义: 未保存的新内置页插回默认位置而非追加到末尾
-      const defaultIndex = BUILTIN_PAGES.findIndex(p => p.id === e.id)
+      // 与 allEntries 同一语义: 默认基准内的路径插回默认位置而非追加到末尾
+      const di = defaultNavIndex(e.id)
       let anchor = -1
-      if (defaultIndex > 0) {
-        for (let i = defaultIndex - 1; i >= 0 && anchor < 0; i -= 1) {
-          anchor = result.findIndex(o => o.id === BUILTIN_PAGES[i].id)
+      if (Number.isFinite(di) && di > 0) {
+        for (let i = di - 1; i >= 0 && anchor < 0; i -= 1) {
+          anchor = result.findIndex(o => defaultNavIndex(o.id) === i)
         }
       }
       if (anchor >= 0) result.splice(anchor + 1, 0, e)
-      else if (defaultIndex >= 0) result.unshift(e)
+      else if (di === 0) result.unshift(e)
       else result.push(e)
     }
     return result
@@ -297,6 +325,25 @@ export function SettingsMenuSettingsPanel() {
     mutationFn: (hidden: string[]) => api.saveNavHidden(hidden),
     onSuccess: () => qc.invalidateQueries({ queryKey: QK.preferences }),
   })
+
+  // 删除源码扩展页: 双重确认 → 后端先备份 zip 再删目录 → 本地移行 + 提示刷新
+  const [deletedBackup, setDeletedBackup] = useState<{ ns: string; backup: string } | null>(null)
+  const deleteExtension = useMutation({
+    mutationFn: (ns: string) => api.pageAdminDeleteSourceExtension(ns),
+    onSuccess: (r) => {
+      setRemovedNs(prev => new Set(prev).add(r.deleted))
+      setDeletedBackup({ ns: r.deleted, backup: r.backup })
+      toast(`已删除 ${r.deleted} (已备份), 刷新页面后从菜单与路由消失`, 'success')
+    },
+    onError: (e: Error) => toast(e.message || '删除失败', 'error'),
+  })
+  const handleRemoveExtension = (entry: NavEntry) => {
+    const ns = entry.extensionId
+    if (!ns) return
+    if (!confirm(`删除源码扩展页「${entry.label}」?\n\n将物理删除 frontend/src/custom/${ns}/ 目录, 刷新后该页面从菜单和路由中消失。`)) return
+    if (!confirm(`二次确认: 删除前会自动备份为 zip (可下载恢复)。确定删除 ${ns}?`)) return
+    deleteExtension.mutate(ns)
+  }
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -330,7 +377,7 @@ export function SettingsMenuSettingsPanel() {
     if (id !== '/monitor') return
     const next = !badgeEnabled
     setBadgeEnabled(next)
-    try { localStorage.setItem('monitor_badge_enabled', next ? '1' : '0') } catch { /* ignore */ }
+    try { setUiPref('monitor_badge_enabled', next ? '1' : '0') } catch { /* ignore */ }
   }
 
   return (
@@ -355,7 +402,7 @@ export function SettingsMenuSettingsPanel() {
       </section>
 
       <section className="rounded-card border border-border bg-surface overflow-hidden">
-        <div className="grid grid-cols-[2.5rem_1fr_4.5rem_3rem_3rem_3rem] items-center border-b border-border px-4 py-2 text-[11px] text-muted">
+        <div className="grid grid-cols-[2.5rem_1fr_4.5rem_3rem_4.5rem_3rem] items-center border-b border-border px-4 py-2 text-[11px] text-muted">
           <div />
           <div>菜单</div>
           <div>类型</div>
@@ -381,6 +428,7 @@ export function SettingsMenuSettingsPanel() {
                 onToggleHidden={toggleHidden}
                 badgeEnabled={entry.id === '/monitor' ? badgeEnabled : undefined}
                 onToggleBadge={entry.id === '/monitor' ? toggleBadge : undefined}
+                onRemove={handleRemoveExtension}
               />
             ))}
           </SortableContext>
@@ -390,6 +438,22 @@ export function SettingsMenuSettingsPanel() {
           <div className="px-5 py-10 text-center text-sm text-muted">正在加载菜单...</div>
         )}
       </section>
+
+      {deletedBackup && (
+        <div className="rounded-card border border-border bg-elevated/40 p-4 text-sm text-secondary flex flex-wrap items-center gap-x-4 gap-y-2">
+          <span>
+            已删除源码扩展页 <span className="font-mono text-foreground">{deletedBackup.ns}</span>，刷新页面后生效。
+          </span>
+          <a
+            href={api.pageAdminBackupUrl(deletedBackup.backup)}
+            download
+            className="rounded border border-border px-2 py-1 text-xs text-accent hover:bg-accent/10 transition-colors"
+          >
+            下载备份 {deletedBackup.backup}
+          </a>
+          <span className="text-xs text-muted">备份同时保存在服务端 data/backups/pages/，误删可解压恢复或 git checkout</span>
+        </div>
+      )}
     </div>
   )
 }

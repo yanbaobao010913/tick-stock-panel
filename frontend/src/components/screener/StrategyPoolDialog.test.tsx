@@ -74,11 +74,12 @@ it('AI tab lists only ai-source drafts with a publish button', async () => {
   clickAiTab()
 
   expect(container.textContent).toContain('AI突破')
-  const publishBtn = Array.from(container.querySelectorAll('button'))
-    .find(b => b.textContent?.includes('发布'))
-  expect(publishBtn).toBeTruthy()
+  const publishButtons = Array.from(container.querySelectorAll('button'))
+    .filter(b => b.textContent?.trim() === '发布')
+  expect(publishButtons).toHaveLength(1)
+  expect(container.textContent).toContain('1 个待发布')
 
-  await act(async () => { publishBtn!.click() })
+  await act(async () => { publishButtons[0].click() })
   expect(mockStrategyPublish).toHaveBeenCalledWith('ai_breakout_v1')
 })
 
@@ -94,21 +95,34 @@ it('builtin research template is not offered for publish anywhere in the pool', 
   expect(container.textContent).not.toContain('因子排名研究')
 })
 
-it('composite strategies have their own tab and are excluded from custom tab', async () => {
+it('keeps composite strategies in the custom group with their own badge', async () => {
   await render()
 
-  // 「叠加」分组只列叠加策略
-  clickTab('叠加')
-  expect(container.textContent).toContain('混合叠加')
-  expect(container.textContent).not.toContain('趋势跟随')
+  expect([...container.querySelectorAll('button')]
+    .some(b => b.textContent?.startsWith('叠加'))).toBe(false)
 
-  // 「自定义」分组不再并入叠加策略
+  // fork 将叠加策略并入「自定义」, 同时保留叠加徽标。
   clickTab('自定义')
   expect(container.textContent).toContain('趋势跟随')
-  expect(container.textContent).not.toContain('混合叠加')
+  expect(container.textContent).toContain('混合叠加')
+  const composite = [...container.querySelectorAll('button')]
+    .find(b => b.textContent?.includes('混合叠加'))!
+  expect([...composite.querySelectorAll('span')]
+    .some(s => s.textContent === '叠加')).toBe(true)
 
   // 「全部」分组仍同时可见两类
   clickTab('全部')
   expect(container.textContent).toContain('趋势跟随')
   expect(container.textContent).toContain('混合叠加')
+})
+
+it('does not offer publishing when only non-AI research templates exist', async () => {
+  mockStrategyList.mockResolvedValue({ strategies: [builtinResearch] })
+  await render()
+  clickAiTab()
+
+  expect(container.textContent).not.toContain('因子排名研究')
+  expect([...container.querySelectorAll('button')]
+    .some(b => b.textContent?.trim() === '发布')).toBe(false)
+  expect(mockStrategyPublish).not.toHaveBeenCalled()
 })

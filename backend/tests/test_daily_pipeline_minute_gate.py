@@ -37,14 +37,22 @@ def _run_pipeline(tmp_path: Path, monkeypatch, minute_provider: str) -> tuple[di
             lambda name: (None, True, None),
         )
     else:
-        # 真 resolver + monkeypatch 自定义源注册表: cnfree 声明 minute 数据集
+        # 真 resolver + monkeypatch 自定义源注册表: 该源声明 minute 数据集
         from app.data_providers import custom as custom_sources
+
+        # 绕开 provider 白名单过滤, 让门控拿到的就是被测的源名
+        monkeypatch.setattr(
+            preferences, "get_minute_data_provider", lambda: minute_provider,
+        )
 
         monkeypatch.setattr(
             custom_sources, "provider_has_dataset",
             lambda name, ds: name == minute_provider and ds == "minute",
         )
-        monkeypatch.setattr(custom_sources, "get_provider", lambda name: object())
+        monkeypatch.setattr(
+            custom_sources, "get_provider",
+            lambda name: SimpleNamespace(config=SimpleNamespace(datasets={"minute"})),
+        )
 
     calls: list[dict] = []
 
@@ -64,6 +72,7 @@ def _run_pipeline(tmp_path: Path, monkeypatch, minute_provider: str) -> tuple[di
 
 @pytest.mark.parametrize("provider,expect_called", [
     ("cnfree", True),    # 自定义源声明 minute 数据集 → 放行 (本次修复的行为)
+    ("customsrc", True),  # 自定义源声明 minute 数据集 → 放行 (本次修复的行为)
     ("tickflow", False),  # TickFlow 无 KLINE_MINUTE_BATCH → 跳过
 ])
 def test_minute_stage_gate_routes_by_provider(tmp_path, monkeypatch, provider, expect_called):

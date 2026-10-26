@@ -31,6 +31,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
   const [dateParam, setDateParam] = useState(pull?.date_param ?? '')
   const [dateFormat, setDateFormat] = useState(pull?.date_format ?? 'iso')
   const [timeField, setTimeField] = useState(pull?.time_field ?? '')
+  const [sinceParam, setSinceParam] = useState(pull?.since_param ?? '')
   const [timeoutSec, setTimeoutSec] = useState(pull?.timeout_seconds ?? 30)
   // 分页协议 (仅 GET): 页码参数名配置后按页循环拉取
   const [pageParam, setPageParam] = useState(pull?.page_param ?? '')
@@ -96,6 +97,7 @@ export function ExtDataPullPanel({ config, onSaved }: {
       date_param: dateParam.trim() || null,
       date_format: dateFormat,
       time_field: timeField.trim() || null,
+      since_param: sinceParam.trim() || null,
       timeout_seconds: effTimeoutSec,
       page_param: pageParam.trim() || null,
       page_size_param: pageSizeParam.trim() || null,
@@ -373,13 +375,25 @@ export function ExtDataPullPanel({ config, onSaved }: {
         </div>
 
         <div>
-          <div className="text-[10px] text-muted mb-1">时间字段 (日内多行数据填, 如 ts · 竞价/分时快照)</div>
+          <div className="text-[10px] text-muted mb-1">时间字段 (日内多行填 ts；无时间列填 __pull_ts__)</div>
           <input
             value={timeField} onChange={e => setTimeField(e.target.value)}
-            placeholder="ts · 留空=每日快照表 (同代码一天一行)"
-            title="配置后同一代码允许一天多行, 按代码+时间列去重"
+            placeholder="ts / __pull_ts__ · 留空=每日快照表"
+            title="按代码+时间列去重；__pull_ts__ 自动注入每次拉取时刻，盘中多次拉取各存一盘"
             className="w-full rounded-btn border border-border bg-elevated px-2.5 py-1.5 text-[10px] font-mono text-foreground placeholder:text-muted/40"
           />
+        </div>
+
+        <div>
+          <div className="text-[10px] text-muted mb-1">增量参数名 (盘中多盘表填，如 since)</div>
+          <input
+            value={sinceParam} onChange={e => setSinceParam(e.target.value)}
+            placeholder="since · 留空=每次全量"
+            disabled={!timeField.trim()}
+            title="每次拉取带上本地已有最大时间值，源仅返回其后数据；需先配置时间字段，两级拉取不适用"
+            className="w-full rounded-btn border border-border bg-elevated px-2.5 py-1.5 text-[10px] font-mono text-foreground placeholder:text-muted/40 disabled:opacity-40"
+          />
+          {!timeField.trim() && <div className="mt-1 text-[10px] text-muted/70">需先填「时间字段」才能增量续传</div>}
         </div>
 
         <div>
