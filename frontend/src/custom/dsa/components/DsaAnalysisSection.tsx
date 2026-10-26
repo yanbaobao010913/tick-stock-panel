@@ -143,7 +143,7 @@ function TaskProgressCard({ taskId, onDone, onGone }: { taskId: string; onDone: 
   const { data: task, error } = useQuery({
     queryKey: ['dsa', 'analysis-task', taskId],
     queryFn: () => dsaApi.analysisTask(taskId),
-    // 404 = 任务已丢失 (如后端重启清内存表), 不重试, 交给 onGone 清理
+    // 404 = 任务记录不存在 (已清理或 id 失效), 不重试, 交给 onGone 清理
     retry: (count, err) => (err as { status?: number }).status === 404 ? false : count < 3,
     // 终态停止轮询; 尚无数据的瞬时失败继续轮询, 避免首次失败永久停表
     refetchInterval: (q) => (q.state.data && q.state.data.status !== 'running' ? false : 2000),
@@ -311,7 +311,7 @@ export function DsaAnalysisSection({ symbol }: { symbol?: string }) {
     refetchInterval: (q) => (q.state.status === 'error' ? 30_000 : false),
   })
 
-  // 任务表只活在后端进程内存里, 组件重挂载/刷新页面就找不到 task_id 了: 开块时按列表找回仍在跑的任务
+  // 任务进度落盘在后端, 组件重挂载/刷新后 localStorage 可能没有 task_id: 开块时按列表找回仍在跑的任务
   useEffect(() => {
     let alive = true
     dsaApi
@@ -435,7 +435,7 @@ export function DsaAnalysisSection({ symbol }: { symbol?: string }) {
                   }}
                   onGone={() => {
                     removeTask(id)
-                    toast('分析任务已丢失（后端重启会清空内存任务表），请重新创建', 'error')
+                    toast('分析任务记录不存在（可能已被清理），请重新创建', 'error')
                   }}
                 />
               ))}

@@ -10,12 +10,15 @@
 重写进一个 JSON 并裁剪历史, 而报告库是归档语义 (P2 还要按 symbol 读最新
 报告), 不适合条数上限, 故自建每报告一文件的存储, 原子写与锁语义保持一致。
 
-任务模型: 内存态任务表 (重启丢任务可接受) + 模块级单工作线程串行消费队列,
-避免并发打爆 LLM 配额。单票失败只记 item 级 error, 不拖垮整任务; 全部 item
-终态后任务置 done (含失败 item); 流水线自身崩溃才把任务置 failed。
+任务模型: 任务清单落盘 (data/user_data/dsa_tasks/<task_id>.json) + 模块级
+单工作线程串行消费队列, 避免并发打爆 LLM 配额。单票失败只记 item 级 error,
+不拖垮整任务; 全部 item 终态后任务置 done (含失败 item); 流水线自身崩溃才把
+任务置 failed。进程重启后启动钩子加载未完成任务, 把 running 重置为 pending
+续跑; 已落盘报告按 symbol/日期/mode 跳过, 避免崩溃窗口重复分析。
 
-定时: daemon 调度线程每 30s 检查一次偏好 (便于响应变更), 交易日偏好时刻
-对全量自选股创建 mode=full 任务; 当日只跑一次 (内存 last-run 日期)。
+定时: daemon 调度线程每 30s 检查一次偏好 (便于响应变更), 交易日偏好时刻之后
+对全量自选股创建 mode=full 任务; 当日只跑一次 (已跑日期由任务文件恢复, 进程
+在偏好时刻之后启动也会补跑当天)。
 
 符号口径 (2026-09-29 P1 修复): 任务创建 / 报告过滤 / 单票分析三个入口统一经
 _canonical_symbol 规范化为 `代码.交易所` 后缀式——仓库 parquet 与 instruments
@@ -67,6 +70,7 @@ EXTENSION_API_VERSION = BACKEND_EXTENSION_API_VERSION
 _MAX_SYMBOLS = 50
 _MAX_LIMIT = 100
 _MODES = ("full", "brief")
+_TASK_ID_RE = re.compile(r"t_[A-Za-z0-9_.-]+")
 _LLM_TIMEOUT_SECONDS = 300.0
 _CHECK_INTERVAL_SECONDS = 30.0
 
@@ -169,6 +173,30 @@ class DsaReportStore:
                 reports.append(data)
         reports.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
         return reports
+
+    def find_for_day(self, symbol: str, day: str, mode: str | None = None) -> dict | None:
+        """指定标的在指定自然日 (YYYY-MM-DD) 的最新报告; 恢复任务时跳过已落盘项。"""
+        prefix = f"r_{str(day).replace('-', '')}_{_safe_symbol(symbol)}_"
+        best: dict | None = None
+        with self._lock:
+            d = self._dir()
+            if not d.exists():
+                return None
+            for p in d.glob(f"{prefix}*.json"):
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as e:
+                    logger.warning("dsa report %s malformed, skipped: %s", p.name, e)
+                    continue
+                if not isinstance(data, dict) or data.get("symbol") != symbol:
+                    continue
+                if not isinstance(data.get("id"), str):
+                    continue
+                if mode is not None and data.get("mode") != mode:
+                    continue
+                if best is None or str(data.get("created_at") or "") > str(best.get("created_at") or ""):
+                    best = data
+        return best
 
     def get(self, report_id: str) -> dict | None:
         rel = _report_filename(report_id)
@@ -469,7 +497,7 @@ def _parse_llm_output(text: str) -> tuple[str, dict]:
 
 
 # ================================================================
-# 任务管理: 内存任务表 + 单工作线程串行队列
+# 任务管理: 落盘任务表 + 单工作线程串行队列
 # ================================================================
 
 _task_lock = threading.Lock()
@@ -481,13 +509,67 @@ _worker_lock = threading.Lock()
 # startup(context) 注入的运行时 (定时任务创建时使用; API 任务按请求解析)
 _RUNTIME: dict[str, Any] = {"repo": None, "data_dir": None}
 
+_ITEM_STATUSES = ("pending", "running", "done", "failed")
+_TASK_STATUSES = ("running", "done", "failed")
 
-def _create_task(symbols: list[str], mode: str, *, repo, data_dir: Path | None) -> dict:
-    task_id = f"t_{cn_now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+
+def _tasks_dir(data_dir: Path | None) -> Path:
+    if data_dir is not None:
+        return Path(data_dir) / "user_data" / "dsa_tasks"
+    from app.config import settings
+
+    return settings.data_dir / "user_data" / "dsa_tasks"
+
+
+def _task_payload(task: dict) -> dict:
+    """任务快照 (只含可序列化字段, 不含运行时 repo/data_dir 引用)。"""
+    with _task_lock:
+        return {
+            "task_id": task["task_id"],
+            "status": task["status"],
+            "mode": task["mode"],
+            "trigger": task.get("trigger", "manual"),
+            "day": task.get("day"),
+            "created_at": task.get("created_at"),
+            "items": [
+                {
+                    "symbol": it["symbol"],
+                    "status": it["status"],
+                    "report_id": it.get("report_id"),
+                    "error": it.get("error"),
+                }
+                for it in task["items"]
+            ],
+        }
+
+
+def _persist_task(task: dict) -> None:
+    """原子写任务快照; 写盘失败只记日志, 不拖垮正在执行的分析。
+
+    必须在 _task_lock 之外调用 (快照在锁内取, 落盘在锁外, 慢磁盘不阻塞查询)。
+    """
+    try:
+        payload = _task_payload(task)
+        d = _tasks_dir(task.get("_data_dir"))
+        d.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(d / f"{payload['task_id']}.json", payload)
+    except Exception:
+        logger.exception("dsa task %s persist failed", task.get("task_id"))
+
+
+def _create_task(
+    symbols: list[str], mode: str, *, repo, data_dir: Path | None,
+    trigger: str = "manual", day: date | None = None,
+) -> dict:
+    now = cn_now()
+    task_id = f"t_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
     task = {
         "task_id": task_id,
         "status": "running",
         "mode": mode,
+        "trigger": trigger,
+        "day": (day or now.date()).isoformat(),
+        "created_at": now.replace(tzinfo=None).isoformat(timespec="seconds"),
         "total": len(symbols),
         "_repo": repo,
         "_data_dir": data_dir,
@@ -495,6 +577,8 @@ def _create_task(symbols: list[str], mode: str, *, repo, data_dir: Path | None) 
     }
     with _task_lock:
         _tasks[task_id] = task
+    # 先落盘再入队: 进程在入队后立刻崩溃也能从任务文件恢复
+    _persist_task(task)
     _ensure_worker()
     _queue.put(task_id)
     return task
@@ -530,6 +614,132 @@ def _list_recent_tasks(limit: int) -> list[dict]:
     return [_task_public(task) for task in reversed(recent)]
 
 
+def _task_from_payload(data: Any, stem: str, data_dir: Path | None) -> dict | None:
+    """校验并还原一条落盘任务; 任一字段非法时整条跳过 (fail-closed)。"""
+    if not isinstance(data, dict):
+        return None
+    task_id = data.get("task_id")
+    if not isinstance(task_id, str) or task_id != stem or not _TASK_ID_RE.fullmatch(task_id):
+        logger.warning("dsa task %s: task_id 与文件名不一致, skipped", stem)
+        return None
+    mode = data.get("mode")
+    if mode not in _MODES:
+        logger.warning("dsa task %s: mode 非法, skipped", stem)
+        return None
+    status = data.get("status")
+    if status not in _TASK_STATUSES:
+        logger.warning("dsa task %s: status 非法, skipped", stem)
+        return None
+    day = data.get("day")
+    if not isinstance(day, str) or not _DATE_PARAM_RE.fullmatch(day):
+        day = f"{task_id[2:6]}-{task_id[6:8]}-{task_id[8:10]}"
+    try:
+        date.fromisoformat(day)
+    except ValueError:
+        logger.warning("dsa task %s: day 非法, skipped", stem)
+        return None
+    created_at = data.get("created_at")
+    if not isinstance(created_at, str) or not created_at:
+        created_at = f"{day}T{task_id[11:13]}:{task_id[13:15]}:{task_id[15:17]}"
+    items_raw = data.get("items")
+    if not isinstance(items_raw, list) or not items_raw:
+        logger.warning("dsa task %s: items 为空, skipped", stem)
+        return None
+    items: list[dict] = []
+    for raw in items_raw:
+        if not isinstance(raw, dict):
+            logger.warning("dsa task %s: item 非法, skipped", stem)
+            return None
+        symbol = raw.get("symbol")
+        item_status = raw.get("status")
+        if not isinstance(symbol, str) or not symbol or item_status not in _ITEM_STATUSES:
+            logger.warning("dsa task %s: item 非法, skipped", stem)
+            return None
+        report_id = raw.get("report_id")
+        error = raw.get("error")
+        items.append({
+            "symbol": symbol,
+            "status": item_status,
+            "report_id": report_id if isinstance(report_id, str) and report_id else None,
+            "error": error if isinstance(error, str) and error else None,
+        })
+    trigger = data.get("trigger") if data.get("trigger") in ("manual", "scheduled") else "manual"
+    return {
+        "task_id": task_id,
+        "status": status,
+        "mode": mode,
+        "trigger": trigger,
+        "day": day,
+        "created_at": created_at,
+        "total": len(items),
+        "_repo": None,
+        "_data_dir": data_dir,
+        "items": items,
+    }
+
+
+def _load_persisted_tasks(data_dir: Path | None) -> list[dict]:
+    """读取任务目录全部有效任务, 按 created_at 升序; 损坏/非法文件跳过。"""
+    d = _tasks_dir(data_dir)
+    if not d.exists():
+        return []
+    loaded: list[dict] = []
+    for p in sorted(d.glob("*.json")):
+        if not _TASK_ID_RE.fullmatch(p.stem):
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            logger.warning("dsa task %s malformed, skipped: %s", p.name, e)
+            continue
+        task = _task_from_payload(data, p.stem, data_dir)
+        if task is not None:
+            loaded.append(task)
+    loaded.sort(key=lambda t: str(t.get("created_at") or ""))
+    return loaded
+
+
+def _recover_persisted_tasks(data_dir: Path | None, repo=None) -> list[str]:
+    """启动时恢复落盘任务: 未完成任务重置 running→pending 后重新入队。
+
+    已完成/失败任务只恢复到内存表 (任务列表与进度查询可见), 不再执行;
+    重复调用幂等 (已在 _tasks 中的 task_id 跳过)。返回重新入队的 task_id 列表。
+    """
+    global _last_run_date
+    queued: list[str] = []
+    for task in _load_persisted_tasks(data_dir):
+        task["_repo"] = repo
+        task["_data_dir"] = data_dir
+        if task.get("trigger") == "scheduled":
+            try:
+                day = date.fromisoformat(str(task.get("day")))
+            except ValueError:
+                day = None
+            if day is not None and (_last_run_date is None or day > _last_run_date):
+                _last_run_date = day
+        with _task_lock:
+            if task["task_id"] in _tasks:
+                continue
+            if task["status"] == "running":
+                for item in task["items"]:
+                    if item["status"] == "running":
+                        item["status"] = "pending"
+                task["resumed"] = True
+            _tasks[task["task_id"]] = task
+        if task["status"] == "running":
+            _persist_task(task)
+            queued.append(task["task_id"])
+    if queued:
+        _ensure_worker()
+        for task_id in queued:
+            _queue.put(task_id)
+        logger.info(
+            "dsa analysis: recovered %d unfinished task(s): %s",
+            len(queued), ", ".join(queued),
+        )
+    return queued
+
+
 def _ensure_worker() -> None:
     global _worker_thread
     with _worker_lock:
@@ -560,21 +770,40 @@ def _process_task(task_id: str) -> None:
     try:
         for item in task["items"]:
             with _task_lock:
+                # 任务表被外部清理 (测试/维护) 时立即停止, 不再消耗队列
+                if _tasks.get(task_id) is not task:
+                    logger.info("dsa analysis task %s unregistered, aborting", task_id)
+                    return
+                if item["status"] in ("done", "failed"):
+                    continue
                 item["status"] = "running"
             try:
-                report = _analyze_one(
-                    task["_repo"], task["_data_dir"], item["symbol"], task["mode"],
-                )
+                # 恢复的任务: 崩溃窗口内已落盘的同日报告直接复用, 不重复调 LLM
+                report = None
+                if task.get("resumed"):
+                    report = _STORE.find_for_day(
+                        item["symbol"], str(task.get("day") or ""), task["mode"],
+                    )
+                if report is None:
+                    report = _analyze_one(
+                        task.get("_repo"), task.get("_data_dir"), item["symbol"], task["mode"],
+                    )
                 with _task_lock:
                     item["status"] = "done"
                     item["report_id"] = report["id"]
+                    item["error"] = None
             except Exception as e:
                 logger.warning("dsa analysis item failed %s: %s", item["symbol"], e)
                 with _task_lock:
                     item["status"] = "failed"
                     item["error"] = str(e) or e.__class__.__name__
+            # 每个 item 终态即落盘, 重启后最多重跑当前这一只
+            _persist_task(task)
         with _task_lock:
+            if _tasks.get(task_id) is not task:
+                return
             task["status"] = "done"
+        _persist_task(task)
         # P2 挂接点 1: 任务收尾自动对账 (只有终态任务触发; 对账异常全吞,
         # 不让 item 全成功的任务被外层 except 冤枉成 failed)
         try:
@@ -587,6 +816,7 @@ def _process_task(task_id: str) -> None:
         logger.exception("dsa analysis task %s crashed: %s", task_id, e)
         with _task_lock:
             task["status"] = "failed"
+        _persist_task(task)
 
 
 # ================================================================
@@ -687,10 +917,14 @@ def _decide_scheduled_run(
     ai_ready: bool,
     symbols: list[str],
 ) -> tuple[bool, str]:
-    """调度判定纯函数: 返回 (是否触发, 原因)。"""
+    """调度判定纯函数: 返回 (是否触发, 原因)。
+
+    触发条件是"到达偏好时刻之后且当日未跑过", 不是分钟精确相等:
+    进程在 18:00 之后启动 (或整点那一拍被阻塞错过) 仍会补跑当天。
+    """
     if not prefs.get("enabled"):
         return False, "disabled"
-    if (now.hour, now.minute) != (int(prefs.get("hour", 18)), int(prefs.get("minute", 0))):
+    if (now.hour, now.minute) < (int(prefs.get("hour", 18)), int(prefs.get("minute", 0))):
         return False, "not_time"
     if last_run_date == now.date():
         return False, "already_ran"
@@ -709,7 +943,10 @@ def _decide_scheduled_run(
 
 
 def _scheduler_tick(now: datetime | None = None) -> tuple[bool, str]:
-    """单次调度检查 (30s 一拍): 判定并在触发时对全量自选创建 mode=full 任务。"""
+    """单次调度检查 (30s 一拍): 判定并在触发时对全量自选创建 mode=full 任务。
+
+    偏好时刻之后启动进程也会补跑当天 (见 _decide_scheduled_run)。
+    """
     global _last_run_date
     now = now or cn_now()
     prefs = _load_schedule()
@@ -730,7 +967,11 @@ def _scheduler_tick(now: datetime | None = None) -> tuple[bool, str]:
         if reason not in ("disabled", "not_time"):
             logger.info("dsa scheduled: 到点但跳过 (%s)", reason)
         return False, reason
-    task = _create_task(symbols, "full", repo=_RUNTIME.get("repo"), data_dir=_RUNTIME.get("data_dir"))
+    task = _create_task(
+        symbols, "full",
+        repo=_RUNTIME.get("repo"), data_dir=_RUNTIME.get("data_dir"),
+        trigger="scheduled", day=now.date(),
+    )
     _last_run_date = now.date()
     logger.info("dsa scheduled: 已创建分析任务 %s (%d 只)", task["task_id"], len(symbols))
     return True, reason
@@ -829,7 +1070,7 @@ def setup(registrar: BackendExtensionRegistrar) -> None:
 
     @router.get("/analysis/tasks")
     def list_analysis_tasks(limit: int = 20) -> dict:
-        """任务列表 (内存态): 前端刷新/重挂载后靠它找回还在跑的任务进度。"""
+        """任务列表 (含重启后恢复的任务): 前端刷新/重挂载后靠它找回进度。"""
         if limit < 1:
             raise HTTPException(status_code=400, detail="limit 须 >= 1")
         return {"tasks": _list_recent_tasks(min(limit, _MAX_LIMIT))}
@@ -907,9 +1148,13 @@ def setup(registrar: BackendExtensionRegistrar) -> None:
 
 
 def startup(context: ExtensionContext) -> None:
-    """记录运行时并启动 daemon 调度线程 (不阻止进程退出)。"""
+    """记录运行时, 恢复未完成任务, 启动 daemon 调度线程 (不阻止进程退出)。"""
     _RUNTIME["repo"] = context.repository
     _RUNTIME["data_dir"] = Path(context.data_dir)
+    try:
+        _recover_persisted_tasks(_RUNTIME["data_dir"], context.repository)
+    except Exception:
+        logger.exception("dsa analysis: 任务恢复失败, 继续启动调度")
     threading.Thread(
         target=_schedule_loop, name="dsa-analysis-scheduler", daemon=True,
     ).start()

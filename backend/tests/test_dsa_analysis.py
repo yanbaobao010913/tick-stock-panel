@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 import polars as pl
 import pytest
@@ -227,6 +227,24 @@ def test_store_skips_corrupt_file_without_killing_list(data_dir):
     (d / "r_20260929_000001_001.json").write_text("{not json", encoding="utf-8")
     assert [r["id"] for r in store.list_reports()] == [good["id"]]
     assert store.get("r_20260929_000001_001.json") is None
+
+
+def test_store_find_for_day_filters_symbol_day_and_mode(data_dir):
+    store = dsa_analysis._STORE
+    full = store.save({
+        "symbol": "600519.SH", "created_at": "2026-09-29T18:00:00", "mode": "full",
+    })
+    brief = store.save({
+        "symbol": "600519.SH", "created_at": "2026-09-29T18:05:00", "mode": "brief",
+    })
+    store.save({
+        "symbol": "600519.SH", "created_at": "2026-09-28T18:00:00", "mode": "full",
+    })
+    assert store.find_for_day("600519.SH", "2026-09-29", "full")["id"] == full["id"]
+    # 不限定 mode 时取当日最新
+    assert store.find_for_day("600519.SH", "2026-09-29")["id"] == brief["id"]
+    assert store.find_for_day("600519.SH", "2026-09-27") is None
+    assert store.find_for_day("000001.SZ", "2026-09-29") is None
 
 
 def test_store_failed_write_keeps_existing_reports(data_dir, monkeypatch):
@@ -627,6 +645,167 @@ def test_task_get_unknown_returns_404(client):
 
 
 # ================================================================
+# 任务落盘与重启续跑
+# ================================================================
+
+def _task_file_payload(task_id: str, *, status: str = "running", trigger: str = "manual",
+                       day: str = "2026-09-29", items: list[dict]) -> dict:
+    return {
+        "task_id": task_id,
+        "status": status,
+        "mode": "full",
+        "trigger": trigger,
+        "day": day,
+        "created_at": f"{day}T18:00:00",
+        "items": items,
+    }
+
+
+def _write_task_file(data_dir, payload: dict) -> None:
+    d = data_dir / "user_data" / "dsa_tasks"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{payload['task_id']}.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8",
+    )
+
+
+def _read_task_file(data_dir, task_id: str) -> dict:
+    return json.loads(
+        (data_dir / "user_data" / "dsa_tasks" / f"{task_id}.json").read_text(encoding="utf-8")
+    )
+
+
+def _wait_task_file(data_dir, task_id: str, predicate, timeout_s: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        data = _read_task_file(data_dir, task_id)
+        if predicate(data):
+            return data
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"task file {task_id} did not match in time: {data}")
+        time.sleep(0.02)
+
+
+def test_task_creation_persists_serializable_snapshot(client, monkeypatch, data_dir):
+    monkeypatch.setattr(dsa_analysis, "generate_ai_text", _mock_llm(_llm_text()))
+    task_id = client.post(TASKS_URL, json={"symbols": ["600519"]}).json()["task_id"]
+    body = _poll_task(client, task_id)
+    saved = _wait_task_file(data_dir, task_id, lambda d: d["status"] == "done")
+    assert saved["task_id"] == task_id
+    assert saved["trigger"] == "manual"
+    assert saved["day"] == saved["created_at"][:10]
+    assert saved["items"] == [{
+        "symbol": "600519.SH", "status": "done",
+        "report_id": body["items"][0]["report_id"], "error": None,
+    }]
+    # 运行时对象不进入任务文件
+    assert "_repo" not in saved and "_data_dir" not in saved
+
+
+def test_recovery_resumes_unfinished_items_and_skips_saved_reports(client, monkeypatch, data_dir):
+    """重启后: done/failed 项不重跑, running 重置 pending, 崩溃窗口内已落盘报告直接复用。"""
+    captured: list = []
+    monkeypatch.setattr(dsa_analysis, "generate_ai_text", _mock_llm(_llm_text(), captured))
+    day = "2026-09-29"
+    done_report = dsa_analysis._STORE.save({
+        "symbol": "600519.SH", "created_at": f"{day}T18:00:01", "mode": "full",
+        "markdown": "已完成",
+    })
+    crash_report = dsa_analysis._STORE.save({
+        "symbol": "000001.SZ", "created_at": f"{day}T18:00:02", "mode": "full",
+        "markdown": "崩溃前已落盘",
+    })
+    task_id = "t_20260929_180000_abcd12"
+    _write_task_file(data_dir, _task_file_payload(task_id, day=day, items=[
+        {"symbol": "600519.SH", "status": "done", "report_id": done_report["id"], "error": None},
+        {"symbol": "000001.SZ", "status": "running", "report_id": None, "error": None},
+        {"symbol": "300750.SZ", "status": "pending", "report_id": None, "error": None},
+        {"symbol": "600000.SH", "status": "failed", "report_id": None, "error": "旧失败"},
+    ]))
+
+    assert dsa_analysis._recover_persisted_tasks(data_dir, StubRepo()) == [task_id]
+    body = _poll_task(client, task_id)
+    assert body["status"] == "done" and body["done"] == 4
+    by_symbol = {i["symbol"]: i for i in body["items"]}
+    assert by_symbol["600519.SH"]["report_id"] == done_report["id"]
+    assert by_symbol["000001.SZ"]["report_id"] == crash_report["id"]
+    assert by_symbol["600000.SH"]["status"] == "failed"
+    assert by_symbol["600000.SH"]["error"] == "旧失败"
+    assert by_symbol["300750.SZ"]["status"] == "done"
+    # 只重跑真正缺失的一只
+    assert len(captured) == 1
+    persisted = _wait_task_file(data_dir, task_id, lambda d: d["status"] == "done")
+    assert [i["status"] for i in persisted["items"]] == ["done", "done", "done", "failed"]
+
+
+def test_recovery_finalizes_task_whose_items_all_finished(client, data_dir):
+    """崩溃发生在最后一个 item 落盘后、任务状态落盘前: 恢复只补终态, 不重跑任何 item。"""
+    task_id = "t_20260929_180000_abcd12"
+    _write_task_file(data_dir, _task_file_payload(task_id, items=[
+        {"symbol": "600519.SH", "status": "done", "report_id": "r_x", "error": None},
+        {"symbol": "000001.SZ", "status": "failed", "report_id": None, "error": "无数据"},
+    ]))
+    assert dsa_analysis._recover_persisted_tasks(data_dir, StubRepo()) == [task_id]
+    body = _poll_task(client, task_id)
+    assert body["status"] == "done" and body["done"] == 2
+    assert [i["status"] for i in body["items"]] == ["done", "failed"]
+    assert body["items"][1]["error"] == "无数据"
+
+
+def test_recovery_loads_finished_tasks_and_skips_malformed_files(client, data_dir):
+    task_id = "t_20260929_180000_abcd12"
+    _write_task_file(data_dir, _task_file_payload(
+        task_id, status="done",
+        items=[{"symbol": "600519.SH", "status": "done",
+                "report_id": "r_20260929_600519.SH_001", "error": None}],
+    ))
+    d = data_dir / "user_data" / "dsa_tasks"
+    (d / "t_20260929_180001_deadbe.json").write_text("{broken", encoding="utf-8")
+    (d / "not-a-task.json").write_text("{}", encoding="utf-8")
+    (d / "t_20260929_180002_deadbe.json").write_text(
+        json.dumps({"task_id": "t_other", "status": "running"}), encoding="utf-8",
+    )
+
+    assert dsa_analysis._recover_persisted_tasks(data_dir) == []
+    assert dsa_analysis._recover_persisted_tasks(data_dir) == []  # 幂等
+    loaded = client.get(f"{TASKS_URL}/{task_id}").json()
+    assert loaded["status"] == "done"
+    assert loaded["items"] == [{
+        "symbol": "600519.SH", "status": "done",
+        "report_id": "r_20260929_600519.SH_001",
+    }]
+    assert client.get(f"{TASKS_URL}/t_20260929_180001_deadbe").status_code == 404
+
+
+def test_fresh_task_reanalyzes_even_if_same_day_report_exists(client, monkeypatch, data_dir):
+    """同日去重只服务恢复任务; 用户手动再次分析同一只仍产生新报告。"""
+    old = dsa_analysis._STORE.save({
+        "symbol": "600519.SH", "mode": "full", "markdown": "旧报告",
+    })
+    monkeypatch.setattr(dsa_analysis, "generate_ai_text", _mock_llm(_llm_text()))
+    task_id = client.post(TASKS_URL, json={"symbols": ["600519"]}).json()["task_id"]
+    body = _poll_task(client, task_id)
+    assert body["items"][0]["status"] == "done"
+    assert body["items"][0]["report_id"] != old["id"]
+
+
+def test_task_persist_failure_does_not_break_analysis(client, monkeypatch, data_dir):
+    real = dsa_analysis._atomic_write_json
+
+    def flaky(path, payload):
+        if str(path.name).startswith("t_"):
+            raise OSError("disk full")
+        return real(path, payload)
+
+    monkeypatch.setattr(dsa_analysis, "_atomic_write_json", flaky)
+    monkeypatch.setattr(dsa_analysis, "generate_ai_text", _mock_llm(_llm_text()))
+    task_id = client.post(TASKS_URL, json={"symbols": ["600519"]}).json()["task_id"]
+    body = _poll_task(client, task_id)
+    assert body["status"] == "done" and body["items"][0]["status"] == "done"
+    assert not (data_dir / "user_data" / "dsa_tasks" / f"{task_id}.json").exists()
+
+
+# ================================================================
 # 报告 API
 # ================================================================
 
@@ -778,8 +957,14 @@ def test_decide_triggers_at_preferred_minute():
     assert _decide() == (True, "trigger")
 
 
-def test_decide_skips_outside_trigger_minute():
-    assert _decide(now=datetime(2026, 9, 29, 18, 1)) == (False, "not_time")
+def test_decide_catches_up_after_preferred_time():
+    """到点后任意一拍都触发 (进程晚启动/整点被阻塞时不漏跑), 到点前不触发。"""
+    assert _decide(now=datetime(2026, 9, 29, 17, 59)) == (False, "not_time")
+    assert _decide(now=datetime(2026, 9, 29, 18, 1)) == (True, "trigger")
+    assert _decide(now=datetime(2026, 9, 29, 23, 59)) == (True, "trigger")
+    prefs = {"enabled": True, "hour": 19, "minute": 30}
+    assert _decide(now=datetime(2026, 9, 29, 19, 29), prefs=prefs) == (False, "not_time")
+    assert _decide(now=datetime(2026, 9, 29, 19, 31), prefs=prefs) == (True, "trigger")
 
 
 def test_decide_runs_once_per_day():
@@ -821,6 +1006,50 @@ def test_scheduler_tick_creates_full_task_once_per_day(monkeypatch, data_dir):
     # 同日第二拍不重跑
     assert dsa_analysis._scheduler_tick(now=now.replace(second=31)) == (False, "already_ran")
     assert len(created) == 1
+
+
+def test_scheduler_tick_catches_up_after_preferred_time(monkeypatch, data_dir):
+    monkeypatch.setattr(dsa_analysis, "_load_schedule",
+                        lambda: {"enabled": True, "hour": 18, "minute": 0})
+    monkeypatch.setattr(dsa_analysis, "is_trading_day", lambda now=None: True)
+    monkeypatch.setattr(dsa_analysis, "ai_configured", lambda: True)
+    monkeypatch.setattr(dsa_analysis, "list_symbols", lambda: [{"symbol": "600519"}])
+    created: list[dict] = []
+    monkeypatch.setattr(
+        dsa_analysis, "_create_task",
+        lambda symbols, mode, **kw: created.append(kw) or {"task_id": "t_x"},
+    )
+    # 18:00 之后的第一次 tick 补跑当天
+    assert dsa_analysis._scheduler_tick(now=datetime(2026, 9, 29, 18, 30)) == (True, "trigger")
+    assert created == [{
+        "repo": None, "data_dir": None, "trigger": "scheduled",
+        "day": date(2026, 9, 29),
+    }]
+    assert dsa_analysis._scheduler_tick(now=datetime(2026, 9, 29, 19, 0)) == (False, "already_ran")
+
+
+def test_recovered_scheduled_task_blocks_same_day_duplicate(monkeypatch, data_dir):
+    """重启恢复当日定时任务后, 调度器不得再创建第二个全量任务。"""
+    _write_task_file(data_dir, _task_file_payload(
+        "t_20260929_180000_abcd12", status="done", trigger="scheduled", day="2026-09-29",
+        items=[{"symbol": "600519.SH", "status": "done",
+                "report_id": "r_20260929_600519.SH_001", "error": None}],
+    ))
+    assert dsa_analysis._recover_persisted_tasks(data_dir) == []
+    assert dsa_analysis._last_run_date == date(2026, 9, 29)
+
+    monkeypatch.setattr(dsa_analysis, "_load_schedule",
+                        lambda: {"enabled": True, "hour": 18, "minute": 0})
+    monkeypatch.setattr(dsa_analysis, "is_trading_day", lambda now=None: True)
+    monkeypatch.setattr(dsa_analysis, "ai_configured", lambda: True)
+    monkeypatch.setattr(dsa_analysis, "list_symbols", lambda: [{"symbol": "600519"}])
+    created: list[dict] = []
+    monkeypatch.setattr(
+        dsa_analysis, "_create_task",
+        lambda symbols, mode, **kw: created.append(kw) or {"task_id": "t_x"},
+    )
+    assert dsa_analysis._scheduler_tick(now=datetime(2026, 9, 29, 19, 0)) == (False, "already_ran")
+    assert created == []
 
 
 def test_scheduler_tick_skips_without_ai_key(monkeypatch, data_dir):

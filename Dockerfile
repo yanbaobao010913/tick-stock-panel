@@ -108,7 +108,10 @@ COPY README.md /README.md
 COPY backend/pyproject.toml backend/uv.lock* ./
 # uv 原生支持同时挂多个 index(主源 + 备用源),会自动在两源中查找,
 # 比逐个重试更稳健 —— 任一源缺包时另一源补位。
-RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
+# uv 的 wheel 缓存挂到 BuildKit cache mount: 依赖变化时不必重新下载约 800MB 的
+# wheel, 也让这一层在纯代码改动下保持缓存命中(层不重建 = 不产生重复层)。
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    if [ "$USE_CN_MIRROR" = "1" ]; then \
       export UV_DEFAULT_INDEX="$PYPI_INDEX" UV_EXTRA_INDEX_URL="$PYPI_FALLBACK"; \
     fi; \
     set -- --no-dev; \
@@ -117,21 +120,11 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
     done; \
     uv sync --frozen "$@" || uv sync "$@"
 
-# Backend code
-# 注意:Docker 里 WORKDIR=/app, 而 config.py 的 _PROJECT_ROOT 是按开发布局
-# (<root>/backend/app/) 推导的, 容器内会错算到 /。这里用环境变量显式指定
-# 三个关键路径, 确保 static / tiers / data 都指向容器内正确位置。
-COPY backend/app ./app
-# stock-sdk 插件依赖: 从 stocksdk-builder 拷入。
-# INCLUDE_STOCKSDK=0(默认) 时, stocksdk-builder 产出空目录,此处拷入空目录,
-# 即最终镜像不含 stock-sdk 依赖,插件默认不可用。
-# COPY --from 不受 .dockerignore 的 **/node_modules 规则影响。
-COPY --from=stocksdk-builder /build/node_modules ./app/plugins/stocksdk/node_modules
-COPY tiers.yaml /app/tiers.yaml
-ENV STATIC_DIR=/app/static \
-    TIERS_YAML=/app/tiers.yaml \
-    DATA_DIR=/app/data \
-    TICKFLOW_ENV_FILE=/app/.env
+# === 分层顺序: 变化越少的层越靠前 ===
+# 镜像里最大的是 uv sync 产出的 /app/.venv(约 800MB) 和 codex 二进制(约 300MB),
+# 后端代码只有几 MB。把高频变化的 backend/app 放到最后一层, 改一次后端代码就只
+# 重建最后几 MB 的层, 不会连带重建 codex、前端 dist、stock-sdk 依赖这些几乎不变
+# 的大层 —— 冷缓存部署时少产生大量重复层。
 
 # Frontend 静态产物
 COPY --from=frontend-builder /build/dist ./static
@@ -139,6 +132,24 @@ COPY --from=frontend-builder /build/dist ./static
 # Codex CLI 使用官方 npm 包携带的当前平台原生二进制，无需运行时 Node.js。
 COPY --from=codex-builder /opt/codex-native /usr/local/bin/codex
 RUN codex --version
+
+# stock-sdk 插件依赖: 从 stocksdk-builder 拷入。
+# INCLUDE_STOCKSDK=0(默认) 时, stocksdk-builder 产出空目录,此处拷入空目录,
+# 即最终镜像不含 stock-sdk 依赖,插件默认不可用。
+# COPY --from 不受 .dockerignore 的 **/node_modules 规则影响。
+# 位置在 backend/app 之前: 该依赖只在插件 lock 变化时才重建, 不该跟着业务代码走。
+COPY --from=stocksdk-builder /build/node_modules ./app/plugins/stocksdk/node_modules
+COPY tiers.yaml /app/tiers.yaml
+ENV STATIC_DIR=/app/static \
+    TIERS_YAML=/app/tiers.yaml \
+    DATA_DIR=/app/data \
+    TICKFLOW_ENV_FILE=/app/.env
+
+# Backend code(最后一层: 唯一的高频变化层)
+# 注意:Docker 里 WORKDIR=/app, 而 config.py 的 _PROJECT_ROOT 是按开发布局
+# (<root>/backend/app/) 推导的, 容器内会错算到 /。这里用环境变量显式指定
+# 三个关键路径, 确保 static / tiers / data 都指向容器内正确位置。
+COPY backend/app ./app
 
 ENV PYTHONPATH=/app
 # 运行时 uv 镜像源持久化: CMD 用 `uv run` 启动, 锁与 pyproject 不一致等场景下

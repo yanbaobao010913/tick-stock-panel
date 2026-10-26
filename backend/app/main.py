@@ -290,6 +290,14 @@ async def _application_lifespan(app: FastAPI):
     from app.watchdog import start_watchdog
     app.state.watchdog = start_watchdog(app.state, repo)
 
+    # 内存取证: 周期记录 RSS + 高水位, 供交易时段 OOM 事后定位 (0=关闭)。
+    try:
+        from app.services.memory_probe import start_sampler
+
+        start_sampler()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("memory probe start failed: %s", e)
+
     # 策略引擎
     from app.services.screener import ScreenerService
     from app.strategy import config as strategy_config
@@ -471,6 +479,9 @@ async def _application_lifespan(app: FastAPI):
         from app.services.quote_service import shutdown_webhook_executor
 
         shutdown_webhook_executor()
+        from app.services.memory_probe import stop_sampler
+
+        stop_sampler()
         logger.info("shutdown")
 
 

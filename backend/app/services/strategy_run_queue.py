@@ -22,6 +22,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from app.services.memory_probe import rss_phase
+
 logger = logging.getLogger(__name__)
 
 _TIMINGS_FILENAME = "strategy_run_timings.json"
@@ -217,7 +219,8 @@ class StrategyRunManager:
         while True:
             handle, job = self._queue.get()
             try:
-                job(handle)
+                with rss_phase("strategy.run_all"):
+                    job(handle)
             except Exception as e:
                 logger.exception("run_all 后台执行失败: %s", e)
                 handle.fail(str(e))

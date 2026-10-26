@@ -76,7 +76,52 @@ logger = logging.getLogger(__name__)
 # send_feishu 内置重试(最坏 ~3×5s 超时 + 退避), 若在 _poll_loop 上同步投递,
 # webhook 慢/宕机会逐条累加, 拖垮整条实时行情+告警轮询。这里 fire-and-forget,
 # 失败由 webhook_adapter 记 WARNING(可见), 但绝不阻塞热路径。
-_WEBHOOK_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="feishu-webhook")
+# 线程池原生队列无界: 对端宕机期间每轮告警都排队, 闭包+事件字典持续吃内存,
+# 故显式限制待投递条数, 超出直接丢弃 (告警落盘与 SSE 已先行完成)。
+_WEBHOOK_MAX_PENDING = 64
+
+
+class _WebhookQueueFull(Exception):
+    """待投递队列已满。"""
+
+
+class _BoundedWebhookExecutor:
+    def __init__(self, max_workers: int, max_pending: int) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="feishu-webhook"
+        )
+        self._pending = threading.BoundedSemaphore(max_pending)
+
+    def submit(self, fn, *args):
+        if not self._pending.acquire(blocking=False):
+            raise _WebhookQueueFull
+        try:
+            future = self._executor.submit(fn, *args)
+        except BaseException:
+            self._pending.release()
+            raise
+        future.add_done_callback(lambda _f: self._pending.release())
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+_WEBHOOK_EXECUTOR = _BoundedWebhookExecutor(max_workers=2, max_pending=_WEBHOOK_MAX_PENDING)
+
+
+def _enqueue_webhook(fn, *args) -> bool:
+    """提交一条投递; 队列满时丢弃本条并记 WARNING。"""
+    try:
+        _WEBHOOK_EXECUTOR.submit(fn, *args)
+    except _WebhookQueueFull:
+        logger.warning(
+            "Webhook 待投递队列已满 (%d 条), 丢弃本条: %s",
+            _WEBHOOK_MAX_PENDING,
+            getattr(fn, "__name__", fn),
+        )
+        return False
+    return True
 
 
 def shutdown_webhook_executor() -> None:
@@ -1718,14 +1763,22 @@ class QuoteService:
                 # 按渠道独立投递: 只投递同时“已勾选 + 已配置”的渠道。
                 # 应用内 alerts.jsonl 记录与 SSE 已在前面完成, 不依赖 webhook 成败,
                 # 失败由 webhook_adapter 记 WARNING(可见)。
-                if feishu_url and "feishu" in channels:
-                    _WEBHOOK_EXECUTOR.submit(webhook_adapter.send_feishu, feishu_url, title, body, feishu_secret)
+                if (
+                    feishu_url
+                    and "feishu" in channels
+                    and _enqueue_webhook(webhook_adapter.send_feishu, feishu_url, title, body, feishu_secret)
+                ):
                     enqueued += 1
-                if wecom_url and "wecom" in channels:
-                    _WEBHOOK_EXECUTOR.submit(webhook_adapter.send_wecom, wecom_url, title, body)
+                if (
+                    wecom_url
+                    and "wecom" in channels
+                    and _enqueue_webhook(webhook_adapter.send_wecom, wecom_url, title, body)
+                ):
                     enqueued += 1
-                if custom_url and "custom" in channels:
-                    _WEBHOOK_EXECUTOR.submit(
+                if (
+                    custom_url
+                    and "custom" in channels
+                    and _enqueue_webhook(
                         webhook_adapter.send_custom,
                         custom_url,
                         title,
@@ -1734,15 +1787,19 @@ class QuoteService:
                         ev,
                         custom_secret,
                     )
+                ):
                     enqueued += 1
-                if email_adapter.is_configured(email_config) and "email" in channels:
-                    _WEBHOOK_EXECUTOR.submit(
+                if (
+                    email_adapter.is_configured(email_config)
+                    and "email" in channels
+                    and _enqueue_webhook(
                         email_adapter.send_email,
                         email_config,
                         email_password,
                         title,
                         body,
                     )
+                ):
                     enqueued += 1
             if enqueued:
                 logger.info("Webhook 已提交 %d 条 (异步投递, 按渠道独立投递, 失败记 WARNING)", enqueued)
@@ -1770,16 +1827,17 @@ class QuoteService:
             enqueued = 0
             for ev in events:
                 body = f"{ev.get('symbol', '')} {ev.get('message', '')}".strip()
-                if feishu_url:
-                    _WEBHOOK_EXECUTOR.submit(
-                        webhook_adapter.send_feishu, feishu_url, "模拟盘成交", body, feishu_secret)
+                if feishu_url and _enqueue_webhook(
+                    webhook_adapter.send_feishu, feishu_url, "模拟盘成交", body, feishu_secret
+                ):
                     enqueued += 1
-                if wecom_url:
-                    _WEBHOOK_EXECUTOR.submit(webhook_adapter.send_wecom, wecom_url, "模拟盘成交", body)
+                if wecom_url and _enqueue_webhook(
+                    webhook_adapter.send_wecom, wecom_url, "模拟盘成交", body
+                ):
                     enqueued += 1
-                if custom_url:
-                    _WEBHOOK_EXECUTOR.submit(
-                        webhook_adapter.send_custom, custom_url, "模拟盘成交", body, "paper_fill", ev, custom_secret)
+                if custom_url and _enqueue_webhook(
+                    webhook_adapter.send_custom, custom_url, "模拟盘成交", body, "paper_fill", ev, custom_secret
+                ):
                     enqueued += 1
             if enqueued:
                 logger.info("模拟盘 Webhook 已提交 %d 条 (异步投递, 失败记 WARNING)", enqueued)
@@ -1838,6 +1896,8 @@ class QuoteService:
                      不写 daily, 直接传给 compute_enriched_today 避免重复计算。
         """
         try:
+            from app.services.memory_probe import rss_mb
+
             today = cn_today()
             t0 = time.perf_counter()
 
@@ -1890,8 +1950,8 @@ class QuoteService:
                 from app.indicators.pipeline import compute_enriched
                 from app.tickflow.repository import _live_agg_window_start
 
-                logger.info("enriched 全量计算 (live_agg=%s, 上次日期=%s)",
-                            "ok" if not live_agg.is_empty() else "空", prev_date)
+                logger.info("enriched 全量计算 (live_agg=%s, 上次日期=%s, RSS %.0fMB)",
+                            "ok" if not live_agg.is_empty() else "空", prev_date, rss_mb() or 0.0)
 
                 cutoff = today - timedelta(days=90)
                 table = {"etf": "kline_etf_daily", "index": "kline_index_daily"}.get(asset_type, "kline_daily")
@@ -1965,7 +2025,8 @@ class QuoteService:
 
             elapsed = time.perf_counter() - t0
             mode_label = "增量" if use_incremental else "全量"
-            logger.info("enriched %s: %d 只, %s, 耗时 %.0fms",
-                        mode_label, len(enriched_today), today, elapsed * 1000)
+            logger.info("enriched %s: %d 只, %s, 耗时 %.0fms, RSS %.0fMB",
+                        mode_label, len(enriched_today), today, elapsed * 1000,
+                        rss_mb() or 0.0)
         except Exception as e:  # noqa: BLE001
             logger.warning("enriched 计算失败: %s", e)

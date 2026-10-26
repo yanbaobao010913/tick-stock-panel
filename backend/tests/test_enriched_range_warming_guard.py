@@ -19,6 +19,7 @@ def _bare_repo() -> KlineRepository:
     repo = KlineRepository.__new__(KlineRepository)
     repo._enriched_history_cache = None
     repo._enriched_warming = True
+    repo._enriched_refresh_cooldown_until = 0.0
     return repo
 
 

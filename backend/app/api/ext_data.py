@@ -677,6 +677,34 @@ def dimension_members(
 # 不做后台预计算 — 板块基数大而单次聚合仅几十毫秒。
 _DIMENSION_INTRADAY_CACHE: dict[tuple[str, str, str, str | None], tuple[float, dict]] = {}
 _DIMENSION_INTRADAY_CACHE_TTL_S = 60.0
+# 键含板块取值与日期, 只靠 TTL 命中判断会留下永久条目 (过期项从不删除),
+# 故插入时顺手清过期并封顶 (FIFO), 防止长期浏览把所有板块/日期的 payload 攒在内存。
+_DIMENSION_INTRADAY_CACHE_MAX = 64
+
+
+def _dimension_intraday_cache_get(key: tuple, now: float) -> dict | None:
+    hit = _DIMENSION_INTRADAY_CACHE.get(key)
+    if hit is None:
+        return None
+    if now - hit[0] < _DIMENSION_INTRADAY_CACHE_TTL_S:
+        return hit[1]
+    _DIMENSION_INTRADAY_CACHE.pop(key, None)
+    return None
+
+
+def _dimension_intraday_cache_put(key: tuple, now: float, payload: dict) -> None:
+    _DIMENSION_INTRADAY_CACHE[key] = (now, payload)
+    if len(_DIMENSION_INTRADAY_CACHE) <= _DIMENSION_INTRADAY_CACHE_MAX:
+        return
+    expired = [
+        cached_key
+        for cached_key, (stamped, _) in _DIMENSION_INTRADAY_CACHE.items()
+        if now - stamped >= _DIMENSION_INTRADAY_CACHE_TTL_S
+    ]
+    for cached_key in expired:
+        _DIMENSION_INTRADAY_CACHE.pop(cached_key, None)
+    while len(_DIMENSION_INTRADAY_CACHE) > _DIMENSION_INTRADAY_CACHE_MAX:
+        _DIMENSION_INTRADAY_CACHE.pop(next(iter(_DIMENSION_INTRADAY_CACHE)))
 # 成分股网格化 ffill 上限: 超大板块退化为逐时间戳可得均值 (内存保护)。
 _DIMENSION_INTRADAY_FFILL_CAP = 2000
 # 分钟 pct 物理边界 (与 services.sector_rotation._PCT_PHYSICAL_BOUND 同值,
@@ -864,12 +892,12 @@ def dimension_intraday(
 
     cache_key = (config_id, field, value.strip(), snapshot_date)
     now = time.monotonic()
-    hit = _DIMENSION_INTRADAY_CACHE.get(cache_key)
-    if hit is not None and now - hit[0] < _DIMENSION_INTRADAY_CACHE_TTL_S:
-        return hit[1]
+    cached = _dimension_intraday_cache_get(cache_key, now)
+    if cached is not None:
+        return cached
 
     payload = _dimension_intraday_compute(config, _data_dir(request), field, value, snapshot_date)
-    _DIMENSION_INTRADAY_CACHE[cache_key] = (now, payload)
+    _dimension_intraday_cache_put(cache_key, now, payload)
     return payload
 
 

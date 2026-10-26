@@ -51,6 +51,7 @@ import polars as pl
 
 from app.market_time import cn_now, cn_today, in_continuous_session
 from app.services import preferences
+from app.services.memory_probe import rss_phase
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +221,8 @@ class MinuteRefreshService:
                 if reason is None:
                     interval = self._effective_interval()
                     started = time.time()
-                    self._run_round()
+                    with rss_phase("minute_refresh.round"):
+                        self._run_round()
                     # 固定节奏: 下一轮 = max(本轮起点+间隔, 本轮完成), 不补跑
                     finish = time.time()
                     self._state.next_round_at = max(started + interval, finish)

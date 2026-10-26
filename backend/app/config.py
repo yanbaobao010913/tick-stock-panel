@@ -141,6 +141,15 @@ class Settings(BaseSettings):
     watchdog_probe_timeout_s: float = 15.0
     watchdog_failure_threshold: int = 2
 
+    # 内存取证采样: 每 N 秒记录一次进程 RSS + 内核高水位 (0=关闭)。
+    # 交易时段 OOM 排查用, 只读 psutil/getrusage, 不做任何控制动作。
+    memory_probe_interval_s: float = 30.0
+
+    # DuckDB 共享连接内存上限, 超出部分溢写到 data_dir/duckdb_tmp。
+    # DuckDB 默认按物理内存 (不感知 cgroup) 取 ~80%, 容器内大聚合可能把
+    # 整个进程推到 OOM; 显式封顶后最多是查询报错/溢写, 不会拖垮进程。
+    duckdb_memory_limit: str = "2GB"
+
     # 策略批量执行 (run_all / 策略页全量跑) 的并发 worker 上限。实测 2026-09-07:
     # polars eager 操作内部已多线程并行, 外层再并发 4 worker 属超订, 41 策略
     # 299.6s 慢于串行 — 默认 1 (串行)。保留开关供配合 POLARS_MAX_THREADS 调优实验。
@@ -193,6 +202,10 @@ class Settings(BaseSettings):
             raise ValueError("watchdog intervals must be positive")
         if self.watchdog_failure_threshold < 1:
             raise ValueError("watchdog_failure_threshold must be >= 1")
+        if self.memory_probe_interval_s < 0:
+            raise ValueError("memory_probe_interval_s must be >= 0")
+        if not self.duckdb_memory_limit.strip():
+            raise ValueError("duckdb_memory_limit must be non-empty")
         if self.strategy_run_all_workers < 1:
             raise ValueError("strategy_run_all_workers must be >= 1")
         if self.strategy_run_all_first_return_s < 0:

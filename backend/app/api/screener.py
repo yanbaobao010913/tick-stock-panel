@@ -111,6 +111,15 @@ def _safe_ext_value(value: Any) -> Any:
 # 无 config 的 DuckDB view 回退路径不缓存 (少见)。
 # 键含目标日期: 同一扩展列的「结果日分区」与「最新分区」是两个独立映射, 不可混用。
 _ext_value_map_cache: dict[tuple[str, str, str], tuple[Any, dict[str, Any]]] = {}
+# 键含结果日期/@时刻, 每个值是一整列 {symbol: value}; 日期推进后旧条目不会再命中,
+# 不封顶会随使用天数线性增长。
+_EXT_VALUE_MAP_CACHE_MAX = 32
+
+
+def _remember_ext_value_map(cache_key: tuple, sig: tuple, vmap: dict[str, Any]) -> None:
+    _ext_value_map_cache[cache_key] = (sig, vmap)
+    while len(_ext_value_map_cache) > _EXT_VALUE_MAP_CACHE_MAX:
+        _ext_value_map_cache.pop(next(iter(_ext_value_map_cache)))
 
 
 def _ext_parquet_signature(cfg, data_dir) -> Optional[tuple]:
@@ -198,7 +207,7 @@ def _load_ext_value_maps(
             }
             value_maps[out_col] = vmap
             if cfg and sig is not None:
-                _ext_value_map_cache[cache_key] = (sig, vmap)
+                _remember_ext_value_map(cache_key, sig, vmap)
         except Exception as e:  # noqa: BLE001
             logger.debug("screener ext column join skipped for %s.%s: %s", config_id, field_name, e)
 

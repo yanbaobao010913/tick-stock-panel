@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 _ENRICHED_WARMUP_MAX_ATTEMPTS = 3
 _ENRICHED_WARMUP_PUBLISH_WAIT_SECONDS = 5.0
 
+# 换代丢弃后的冷却期。盘中 quote 刷新每 10~20s commit 一次, 300 天重算 (~19s)
+# 必然过期; 不冷却时 warmup 三连试 + 懒加载路径会背靠背重复分配百万行宽表,
+# 内存冲顶 (线上 2.5G cgroup OOM)。冷却期内一律不再触发全量重算。
+_ENRICHED_REFRESH_COOLDOWN_SECONDS = 120.0
+
 
 def replace_with_retry(src: Path, dst: Path, *, attempts: int = 10, delay_s: float = 0.5) -> None:
     """os.replace 的 Windows 读锁重试版。
@@ -141,6 +146,7 @@ class DataStore:
             "ai_cache",
             "user_data",
             "depth5",
+            "duckdb_tmp",
         ):
             (self.data_dir / sub).mkdir(parents=True, exist_ok=True)
 
@@ -148,8 +154,16 @@ class DataStore:
         for sub in ("metrics", "income", "balance_sheet", "cash_flow", "shares"):
             (self.data_dir / "financials" / sub).mkdir(parents=True, exist_ok=True)
 
-        # DuckDB 内存模式 — 不建 .db 文件(§7.1)
-        self.db = duckdb.connect(database=":memory:")
+        # DuckDB 内存模式 — 不建 .db 文件(§7.1)。
+        # 显式内存上限 + 溢写目录: 默认估算按物理内存且不感知 cgroup, 容器内
+        # 大聚合可能把进程推到 OOM; 超限后溢写磁盘, 最坏是查询报错而非进程被杀。
+        self.db = duckdb.connect(
+            database=":memory:",
+            config={
+                "memory_limit": settings.duckdb_memory_limit,
+                "temp_directory": str(self.data_dir / "duckdb_tmp"),
+            },
+        )
         self._register_views()
 
     def _migrate_legacy_data_dir(self) -> None:
@@ -407,6 +421,8 @@ class KlineRepository:
         # 推到 daemon 线程异步完成。预热期间 get_enriched_latest / get_live_agg
         # 返回空表 (上层优雅降级), 不触发同步重算 (否则会抵消异步化收益)。
         self._enriched_warming: bool = False
+        # 换代丢弃冷却截止时刻 (time.monotonic); 0 表示不在冷却期
+        self._enriched_refresh_cooldown_until: float = 0.0
         self._warmup_thread: threading.Thread | None = None
         self._warmup_lock = threading.Lock()
         # 预热完成后的回调 (lifespan 注入, 用于设置 app.state.indicators_ready)
@@ -575,6 +591,15 @@ class KlineRepository:
         self._name_map_cache = None
         self._index_enriched_cache = None
         self._index_enriched_cache_date = None
+        self._enriched_refresh_cooldown_until = 0.0
+
+    def _enriched_refresh_in_cooldown(self) -> bool:
+        """换代丢弃后的冷却期内, 禁止再次触发全量重算。
+
+        盘中行情 commit 间隔 (10~20s) 短于 300 天重算耗时 (~19s), 漂移是结构性的;
+        冷却期让失败的尝试不立刻重来, 避免百万行宽表反复分配把内存顶到上限。
+        """
+        return time.monotonic() < self._enriched_refresh_cooldown_until
 
     def _refresh_enriched(self) -> bool:
         """刷新 enriched 内存缓存。返回 True 表示因数据换代被丢弃、可重试。
@@ -583,12 +608,21 @@ class KlineRepository:
         现有调用方均不读返回值, 行为不变; 仅后台 warmup 线程用返回值做有界重建。
         """
         from app.services.heavy_job_limiter import shared_heavy_job_limiter
+        from app.services.memory_probe import rss_phase
 
-        with shared_heavy_job_limiter.slot("exclusive"):
+        with shared_heavy_job_limiter.slot("exclusive"), rss_phase("enriched.refresh"):
             try:
                 self._refresh_enriched_impl()
+                self._enriched_refresh_cooldown_until = 0.0
             except EnrichedGenerationUnavailableError as e:
-                logger.warning("enriched 历史缓存因数据换代被丢弃 (可重试): %s", e)
+                self._enriched_refresh_cooldown_until = (
+                    time.monotonic() + _ENRICHED_REFRESH_COOLDOWN_SECONDS
+                )
+                logger.warning(
+                    "enriched 历史缓存因数据换代被丢弃 (可重试), %.0fs 内不再重算: %s",
+                    _ENRICHED_REFRESH_COOLDOWN_SECONDS,
+                    e,
+                )
                 return True
             except Exception as e:  # noqa: BLE001
                 logger.warning("enriched 缓存刷新失败: %s", e)
@@ -604,6 +638,14 @@ class KlineRepository:
         等待再试; 超过上限则放弃并保持冷缓存降级 (非无限重读)。
         """
         for attempt in range(_ENRICHED_WARMUP_MAX_ATTEMPTS):
+            if self._enriched_refresh_in_cooldown():
+                # 上一轮已因换代丢弃: 重试窗口内数据仍在变, 立刻重算只会再分配一份
+                # 百万行宽表。冷却结束后的下一次预热/懒加载会重新尝试。
+                logger.info(
+                    "enriched warmup paused: 换代冷却中 (剩余 %.0fs)",
+                    max(0.0, self._enriched_refresh_cooldown_until - time.monotonic()),
+                )
+                return
             if attempt and enriched_publication_incomplete(self.store.data_dir, "stock"):
                 time.sleep(_ENRICHED_WARMUP_PUBLISH_WAIT_SECONDS)
             if not self._refresh_enriched():
@@ -1223,11 +1265,11 @@ class KlineRepository:
     def get_enriched_latest(self) -> tuple[pl.DataFrame, date | None]:
         """返回缓存的 enriched 最新日 DataFrame + 日期。如无缓存则懒加载。
 
-        后台预热期间 (_enriched_warming=True) 返回空表, 不触发同步重算 ——
-        否则首次访问会把异步化想避免的 50s+ 计算拉回同步路径。
+        后台预热期间 (_enriched_warming=True) 或换代冷却期返回空表, 不触发同步
+        重算 —— 否则首次访问会把异步化想避免的 50s+ 计算拉回同步路径。
         """
         if self._enriched_cache is None:
-            if self._enriched_warming:
+            if self._enriched_warming or self._enriched_refresh_in_cooldown():
                 return pl.DataFrame(), None
             self._refresh_enriched()
         if self._enriched_cache is None:
@@ -1296,8 +1338,8 @@ class KlineRepository:
     ) -> pl.DataFrame | None:
         """从预计算 enriched 历史缓存返回完整区间；缓存不覆盖时返回 None。"""
         if self._enriched_history_cache is None:
-            if self._enriched_warming:
-                # 后台预热中: 返回 None (缓存不覆盖), 调用方各自走慢路径;
+            if self._enriched_warming or self._enriched_refresh_in_cooldown():
+                # 后台预热中 / 换代冷却中: 返回 None (缓存不覆盖), 调用方各自走慢路径;
                 # 否则请求线程会与预热线程并发重复 300 天全量重算
                 # (同 get_enriched_latest 的守卫语义)。
                 return None

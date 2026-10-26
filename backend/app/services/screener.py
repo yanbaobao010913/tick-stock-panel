@@ -15,6 +15,7 @@ from pathlib import Path
 
 import polars as pl
 
+from app.config import settings
 from app.parquet import scan_enriched_parquet
 from app.tickflow.repository import KlineRepository
 
@@ -402,7 +403,11 @@ class ScreenerService:
         try:
             import duckdb
             con = duckdb.connect(
-                database=":memory:", config={"enable_external_access": False}
+                database=":memory:",
+                config={
+                    "enable_external_access": False,
+                    "memory_limit": settings.duckdb_memory_limit,
+                },
             )
             con.register("enriched", df.to_arrow())
             where = " AND ".join(f"({c})" for c in conditions)
