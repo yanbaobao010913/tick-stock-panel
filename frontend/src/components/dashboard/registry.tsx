@@ -21,6 +21,7 @@ import {
 } from './widgets'
 import type { DashboardItem, WidgetType } from './layout'
 import { ExternalLinkWidget } from './ExternalLinkWidget'
+import { EtfShareWidget } from './EtfShareWidget'
 
 /** 渲染上下文: 数据切片与交互回调(由 Dashboard 页提供, 组件不自取数据) */
 export interface WidgetCtx {
@@ -260,6 +261,10 @@ export const WIDGET_DEFS: WidgetDef[] = [
     render: ctx => <MonitorSection ctx={ctx} />,
   },
   {
+    id: 'etf-share', label: '300ETF 份额', icon: Coins, minW: 4, minH: 6, defW: 6, defH: 10,
+    render: () => <EtfShareWidget />,
+  },
+  {
     id: 'ext-link', label: '外部链接', icon: Link2, minW: 2, minH: 5, defW: 6, defH: 10,
     render: (_ctx, item) => <ExternalLinkWidget title={item.p?.title ?? '外部链接'} url={item.p?.url ?? 'about:blank'} />,
   },
@@ -297,4 +302,5 @@ export const DEFAULT_LAYOUT: DashboardItem[] = [
   { i: 'losers', t: 'losers', x: 2, y: 21, w: 2, h: 13 },
   { i: 'turnover', t: 'turnover', x: 4, y: 21, w: 2, h: 13 },
   { i: 'activity', t: 'activity', x: 6, y: 21, w: 2, h: 13 },
+  { i: 'etf-share', t: 'etf-share', x: 0, y: 34, w: 12, h: 9 },
 ]

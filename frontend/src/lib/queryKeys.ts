@@ -18,6 +18,7 @@ export const QK = {
   dataSources:    ['data-sources'] as const,
   capabilityMatrix: ['capability-matrix'] as const,
   quoteStatus:    ['quote-status'] as const,
+  etfShareMonthly: (months: number) => ['etf-share-monthly', months] as const,
   quoteInterval:  ['quote-interval'] as const,
   overviewMarket: (asOf?: string) => ['overview-market', asOf ?? 'latest'] as const,
   indexQuotes:    ['index-quotes'] as const,

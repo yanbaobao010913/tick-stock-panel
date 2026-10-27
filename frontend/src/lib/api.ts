@@ -492,6 +492,25 @@ export interface OverviewDimensionRankItem {
   } | null
 }
 
+export interface EtfShareRow {
+  month: string
+  date: string
+  /** 月末合计份额(亿份) */
+  share: number
+  /** 月度净申赎(亿份); 断月为 null, 不能当 0 */
+  flow: number | null
+}
+
+export interface EtfShareMonthly {
+  funds: { code: string; name: string }[]
+  /** 口径说明: 仅沪市标的, 深市无免费日频份额 */
+  note: string
+  rows: EtfShareRow[]
+  as_of: string | null
+  source: 'live' | 'cache' | 'none'
+  error?: string
+}
+
 export interface OverviewMarket {
   as_of: string | null
   quote_status: {
@@ -2851,6 +2870,9 @@ export const api = {
     request<{ rows: IndexQuote[]; count: number }>(
       `/api/intraday/indices${symbols?.length ? `?symbols=${encodeURIComponent(symbols.join(','))}` : ''}`,
     ),
+  /** 头部沪深300ETF 月末份额与净申赎(亿份), 数据源为上交所每日基金份额披露 */
+  etfShareMonthly: (months = 12) =>
+    request<EtfShareMonthly>(`/api/etf-share/monthly?months=${months}`, { timeoutMs: 60_000 }),
   updateRealtimeMonitorConfig: (cfg: {
     sse_refresh_pages?: Record<string, boolean>
     strategy_monitor_enabled?: boolean
